@@ -1,0 +1,863 @@
+diff -ruN xv6-public/console.c xv6-final/console.c
+--- xv6-public/console.c	2021-09-15 20:58:56.718412559 +0530
++++ xv6-final/console.c	2021-09-15 18:35:48.178104270 +0530
+@@ -14,6 +14,14 @@
+ #include "mmu.h"
+ #include "proc.h"
+ #include "x86.h"
++#include "console.h"
++
++// ---------------------------------------------------------------
++#define UP_ARROW 226
++#define DOWN_ARROW 227
++#define LEFT_ARROW 228
++#define RIGHT_ARROW 229
++// ---------------------------------------------------------------
+ 
+ static void consputc(int);
+ 
+@@ -139,12 +147,26 @@
+   outb(CRTPORT, 15);
+   pos |= inb(CRTPORT+1);
+ 
+-  if(c == '\n')
+-    pos += 80 - pos%80;
+-  else if(c == BACKSPACE){
+-    if(pos > 0) --pos;
+-  } else
+-    crt[pos++] = (c&0xff) | 0x0700;  // black on white
++  // if(c == '\n')
++  //   pos += 80 - pos%80;
++  // else if(c == BACKSPACE){
++  //   if(pos > 0) --pos;
++  // } else
++  //   crt[pos++] = (c&0xff) | 0x0700;  // black on white
++
++  switch(c) {
++    case '\n':
++      pos += 80 - pos%80;
++      break;   
++    case BACKSPACE:
++      if(pos > 0) --pos;
++      break;
++    case LEFT_ARROW:
++      if(pos > 0) --pos;
++      break;
++    default:
++      crt[pos++] = (c&0xff) | 0x0700;  // black on white
++  }
+ 
+   if(pos < 0 || pos > 25*80)
+     panic("pos under/overflow");
+@@ -159,7 +181,9 @@
+   outb(CRTPORT+1, pos>>8);
+   outb(CRTPORT, 15);
+   outb(CRTPORT+1, pos);
+-  crt[pos] = ' ' | 0x0700;
++  // crt[pos] = ' ' | 0x0700;
++  if (c == BACKSPACE)
++    crt[pos] = ' ' | 0x0700;
+ }
+ 
+ void
+@@ -173,26 +197,101 @@
+ 
+   if(c == BACKSPACE){
+     uartputc('\b'); uartputc(' '); uartputc('\b');
+-  } else
++  } else if(c == LEFT_ARROW){
++    uartputc('\b');
++  } else {
+     uartputc(c);
++  }
++  
+   cgaputc(c);
+ }
+ 
+ #define INPUT_BUF 128
+ struct {
+   char buf[INPUT_BUF];
+-  uint r;  // Read index
+-  uint w;  // Write index
+-  uint e;  // Edit index
++  uint r;  // Read index, exec will start reading the command from here
++  uint w;  // Write index, exec will finish reading the command here
++  uint e;  // Edit index, current caret position
++  uint rightmost; // the first empty char in the line
+ } input;
+ 
++char charsToBeMoved[INPUT_BUF];  // temporary storage for input.buf in a certain context
++char buf2[INPUT_BUF];
++
++/*
++  this struct will hold the history buffer array
++*/
++struct {
++  char bufferArr[MAX_HISTORY][INPUT_BUF]; //holds the actual command strings -
++  uint lengthsArr[MAX_HISTORY]; // this will hold the length of each command string
++  uint lastCommandIndex;  //the index of the last command entered to history
++  int numOfCommmandsInMem; //number of history commands in mem
++  int currentHistory;//this will hold the current history view (the oldest will be MAX_HISTORY-1)
++} historyBufferArray;
++
++char oldBuf[INPUT_BUF];// this will hold the details of the command that was written before accessing the history
++uint lengthOfOldBuf;
++
+ #define C(x)  ((x)-'@')  // Control-x
+ 
++/*
++Copy input.buf to a safe location. Used only when punching in new keys and the
++caret isn't at the end of the line.
++*/
++void copyCharsToBeMoved() {
++  uint n = input.rightmost - input.e;
++  uint i;
++  for (i = 0; i < n; i++)
++    charsToBeMoved[i] = input.buf[(input.e + i) % INPUT_BUF];
++}
++
++/*
++Shift input.buf one byte to the right, and repaint the chars on-screen. Used
++Used only when punching in new keys and the caret isn't at the end of the line.
++*/
++void shiftbufright() {
++  uint n = input.rightmost - input.e;
++  int i;
++  for (i = 0; i < n; i++) {
++
++    char c = charsToBeMoved[i];
++    input.buf[(input.e + i) % INPUT_BUF] = c;
++    consputc(c);
++  }
++  // reset charsToBeMoved for future use
++  memset(charsToBeMoved, '\0', INPUT_BUF);
++  // return the caret to its correct position
++  for (i = 0; i < n; i++) {
++    consputc(LEFT_ARROW);
++  }
++}
++
++/*
++Shift input.buf one byte to the left, and repaint the chars on-screen. Used
++Used only when punching in BACKSPACE and the caret isn't at the end of the line.
++*/
++void shiftbufleft() {
++  uint n = input.rightmost - input.e;
++  uint i;
++  consputc(LEFT_ARROW);
++  input.e--;
++  for (i = 0; i < n; i++) {
++    char c = input.buf[(input.e + i + 1) % INPUT_BUF];
++    input.buf[(input.e + i) % INPUT_BUF] = c;
++    consputc(c);
++  }
++  input.rightmost--;
++  consputc(' '); // delete the last char in line
++  for (i = 0; i <= n; i++) {
++    consputc(LEFT_ARROW); // shift the caret back to the left
++  }
++}
++
+ void
+ consoleintr(int (*getc)(void))
+ {
+   int c, doprocdump = 0;
+-
++  uint tempIndex;
+   acquire(&cons.lock);
+   while((c = getc()) >= 0){
+     switch(c){
+@@ -201,27 +300,126 @@
+       doprocdump = 1;
+       break;
+     case C('U'):  // Kill line.
+-      while(input.e != input.w &&
+-            input.buf[(input.e-1) % INPUT_BUF] != '\n'){
+-        input.e--;
+-        consputc(BACKSPACE);
++      if (input.rightmost > input.e) { // caret isn't at the end of the line
++        uint numtoshift = input.rightmost - input.e;
++        uint placestoshift = input.e - input.w;
++        uint i;
++        for (i = 0; i < placestoshift; i++) {
++          consputc(LEFT_ARROW);
++        }
++        memset(buf2, '\0', INPUT_BUF);
++        for (i = 0; i < numtoshift; i++) {
++          buf2[i] = input.buf[(input.w + i + placestoshift) % INPUT_BUF];
++        }
++        for (i = 0; i < numtoshift; i++) {
++          input.buf[(input.w + i) % INPUT_BUF] = buf2[i];
++        }
++        input.e -= placestoshift;
++        input.rightmost -= placestoshift;
++        for (i = 0; i < numtoshift; i++) { // repaint the chars
++          consputc(input.buf[(input.e + i) % INPUT_BUF]);
++        }
++        for (i = 0; i < placestoshift; i++) { // erase the leftover chars
++          consputc(' ');
++        }
++        for (i = 0; i < placestoshift + numtoshift; i++) { // move the caret back to the left
++          consputc(LEFT_ARROW);
++        }
++      }
++      else { // caret is at the end of the line -                                       ( deleting everything from both screen and inputbuf)
++        while(input.e != input.w &&
++              input.buf[(input.e - 1) % INPUT_BUF] != '\n'){
++          input.e--;
++          input.rightmost--;
++          consputc(BACKSPACE);
++        }
+       }
+       break;
+     case C('H'): case '\x7f':  // Backspace
+-      if(input.e != input.w){
++      if (input.rightmost != input.e && input.e != input.w) { // caret isn't at the end of the line
++        shiftbufleft();
++        break;
++      }
++      if(input.e != input.w){ // caret is at the end of the line - deleting last char
+         input.e--;
++        input.rightmost--;
+         consputc(BACKSPACE);
+       }
+       break;
++    case LEFT_ARROW:
++      if (input.e != input.w) {
++        input.e--;
++        consputc(c);
++      }
++      break;
++    case RIGHT_ARROW:
++      if (input.e < input.rightmost) {
++        consputc(input.buf[input.e % INPUT_BUF]);
++        input.e++;
++      }
++      else if (input.e == input.rightmost){
++        consputc(' ');
++        consputc(LEFT_ARROW);
++      }
++      break;
++    case UP_ARROW:
++      if (historyBufferArray.currentHistory < historyBufferArray.numOfCommmandsInMem-1 ){ // current history means the oldest possible will be MAX_HISTORY-1
++        earaseCurrentLineOnScreen();
++        if (historyBufferArray.currentHistory == -1)
++            copyCharsToBeMovedToOldBuf();
++        earaseContentOnInputBuf();
++        historyBufferArray.currentHistory++;
++        tempIndex = (historyBufferArray.lastCommandIndex + historyBufferArray.currentHistory) %MAX_HISTORY;
++        copyBufferToScreen(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
++        copyBufferToInputBuf(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
++      }
++      break;
++    case DOWN_ARROW:
++      switch(historyBufferArray.currentHistory){
++        case -1:
++          //does nothing
++          break;
++        case 0: //get string from old buf
++          earaseCurrentLineOnScreen();
++          copyBufferToInputBuf(oldBuf, lengthOfOldBuf);
++          copyBufferToScreen(oldBuf, lengthOfOldBuf);
++          historyBufferArray.currentHistory--;
++          break;
++        default:
++          earaseCurrentLineOnScreen();
++          historyBufferArray.currentHistory--;
++          tempIndex = (historyBufferArray.lastCommandIndex + historyBufferArray.currentHistory)%MAX_HISTORY;
++          copyBufferToScreen(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
++          copyBufferToInputBuf(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
++          break;
++      }
++      break;
++    // case '\r':
++    //   input.e = input.rightmost;
+     default:
+       if(c != 0 && input.e-input.r < INPUT_BUF){
+         c = (c == '\r') ? '\n' : c;
+-        input.buf[input.e++ % INPUT_BUF] = c;
+-        consputc(c);
+-        if(c == '\n' || c == C('D') || input.e == input.r+INPUT_BUF){
+-          input.w = input.e;
++        if(c == '\n' || c == C('D') || input.rightmost == input.r + INPUT_BUF - 1){
++          input.buf[input.rightmost++ % INPUT_BUF] = c;
++          consputc(c);
++          saveCommandInHistory();
++          input.w = input.e = input.rightmost;
+           wakeup(&input.r);
+         }
++        else {
++          if (input.rightmost > input.e) { // caret isn't at the end of the line
++            copyCharsToBeMoved();
++            input.buf[input.e++ % INPUT_BUF] = c;
++            input.rightmost++;
++            consputc(c);
++            shiftbufright();
++          }
++          else {
++            input.buf[input.e++ % INPUT_BUF] = c;
++            input.rightmost = input.e - input.rightmost == 1 ? input.e : input.rightmost;
++            consputc(c);
++          }
++        }
+       }
+       break;
+     }
+@@ -232,6 +430,101 @@
+   }
+ }
+ 
++/*
++  this method eareases the current line from screen
++*/
++void
++earaseCurrentLineOnScreen(void){
++    uint numToEarase = input.rightmost - input.r;
++    uint i,j;
++    for(j = 0;j<input.rightmost-input.e;j++){
++      consputc(RIGHT_ARROW);
++    }
++    for (i = 0; i < numToEarase; i++) {
++      consputc(BACKSPACE);
++    }
++}
++
++/*
++  this method copies the chars currently on display (and on Input.buf) to oldBuf and save its length on current_history_viewed.lengthOld
++*/
++void
++copyCharsToBeMovedToOldBuf(void){
++    lengthOfOldBuf = input.rightmost - input.r;
++    uint i;
++    for (i = 0; i < lengthOfOldBuf; i++) {
++        oldBuf[i] = input.buf[(input.r+i)%INPUT_BUF];
++    }
++}
++
++/*
++  this method earase all the content of the current command on the inputbuf
++*/
++void
++earaseContentOnInputBuf(){
++  input.rightmost = input.r;
++  input.e = input.r;
++}
++
++/*
++  this method will print the given buf on the screen
++*/
++void
++copyBufferToScreen(char * bufToPrintOnScreen, uint length){
++  uint i;
++  for (i = 0; i < length; i++) {
++    consputc(bufToPrintOnScreen[i]);
++  }
++}
++
++/*
++  this method will copy the given buf to Input.buf
++  will set the input.e and input.rightmost
++  assumes input.r=input.w=input.rightmost=input.e
++*/
++void
++copyBufferToInputBuf(char * bufToSaveInInput, uint length){
++  uint i;
++  for (i = 0; i < length; i++) {
++    input.buf[(input.r+i)%INPUT_BUF] = bufToSaveInInput[i];
++  }
++  input.e = input.r+length;
++  input.rightmost = input.e;
++}
++
++/*
++  this method copies the current command in the input.buf to the saved history
++  @param length - length of command to be saved
++*/
++void
++saveCommandInHistory(){
++  historyBufferArray.currentHistory= -1;//reseting the users history current viewed
++  if (historyBufferArray.numOfCommmandsInMem < MAX_HISTORY)
++    historyBufferArray.numOfCommmandsInMem++; //when we get to MAX_HISTORY commands in memory we keep on inserting to the array in a circular mution
++  uint l = input.rightmost-input.r -1;
++  historyBufferArray.lastCommandIndex = (historyBufferArray.lastCommandIndex - 1)%MAX_HISTORY;
++  historyBufferArray.lengthsArr[historyBufferArray.lastCommandIndex] = l;
++  uint i;
++  for (i = 0; i < l; i++) { //do not want to save in memory the last char '/n'
++    historyBufferArray.bufferArr[historyBufferArray.lastCommandIndex][i] =  input.buf[(input.r+i)%INPUT_BUF];
++  }
++
++}
++
++/*
++  this is the function that gets called by the sys_history and writes the requested command history in the buffer
++*/
++int history(char *buffer, int historyId) {
++  if (historyId < 0 || historyId > MAX_HISTORY - 1)
++    return -2;
++  if (historyId >= historyBufferArray.numOfCommmandsInMem )
++    return -1;
++  memset(buffer, '\0', INPUT_BUF);
++  int tempIndex = (historyBufferArray.lastCommandIndex + historyId) % MAX_HISTORY;
++  memmove(buffer, historyBufferArray.bufferArr[tempIndex], historyBufferArray.lengthsArr[tempIndex]);
++  return 0;
++}
++
+ int
+ consoleread(struct inode *ip, char *dst, int n)
+ {
+@@ -296,4 +589,3 @@
+ 
+   ioapicenable(IRQ_KBD, 0);
+ }
+-
+diff -ruN xv6-public/console.h xv6-final/console.h
+--- xv6-public/console.h	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/console.h	2021-09-15 18:35:48.178104270 +0530
+@@ -0,0 +1,56 @@
++#include "types.h"
++
++#define UP_ARROW 226
++#define DOWN_ARROW 227
++#define LEFT_ARROW 228
++#define RIGHT_ARROW 229
++
++#define INPUT_BUF 128
++#define BACKSPACE 0x100
++#define CRTPORT 0x3d4
++
++#define MAX_HISTORY 16
++
++/*
++  this method eareases the current line from screen
++*/
++void
++earaseCurrentLineOnScreen(void);
++
++/*
++  this method copies the chars currently on display (and on Input.buf) to oldBuf and save its length on current_history_viewed.lengthOld
++*/
++void
++copyCharsToBeMovedToOldBuf(void);
++
++/*
++  this method earase all the content of the current command on the inputbuf
++*/
++void
++earaseContentOnInputBuf();
++
++/*
++  this method will print the given buf on the screen
++*/
++void
++copyBufferToScreen(char * bufToPrintOnScreen, uint length);
++
++/*
++  this method will copy the given buf to Input.buf
++  will set the input.e and input.rightmost
++  assumes input.r=input.w=input.rightmost=input.e                                                                   
++*/
++void
++copyBufferToInputBuf(char * bufToSaveInInput, uint length);
++
++/*
++  this method copies the current command in the input.buf to the saved history 
++  @param length - length of command to be saved                                                                                 //GILAD QUES who should call this??
++*/
++void
++saveCommandInHistory();
++
++/*
++  this is the function that gets called by the sys_history and writes the requested command history in the buffer
++*/
++int history(char *buffer, int historyId);
+diff -ruN xv6-public/defs.h xv6-final/defs.h
+--- xv6-public/defs.h	2021-09-15 20:58:56.718412559 +0530
++++ xv6-final/defs.h	2021-09-15 18:35:48.178104270 +0530
+@@ -22,6 +22,7 @@
+ void            consoleintr(int(*)(void));
+ void            panic(char*) __attribute__((noreturn));
+ 
++
+ // exec.c
+ int             exec(char*, char**);
+ 
+@@ -121,6 +122,7 @@
+ void            wakeup(void*);
+ void            yield(void);
+ 
++int wait2(int*, int*, int*);
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+ 
+diff -ruN xv6-public/.git/config xv6-final/.git/config
+--- xv6-public/.git/config	2021-09-15 20:58:56.714412530 +0530
++++ xv6-final/.git/config	2021-09-15 18:35:48.170104212 +0530
+@@ -4,8 +4,8 @@
+ 	bare = false
+ 	logallrefupdates = true
+ [remote "origin"]
+-	url = git://github.com/mit-pdos/xv6-public.git
++	url = git://github.com/Anu8690/xv6-final.git
+ 	fetch = +refs/heads/*:refs/remotes/origin/*
+-[branch "master"]
++[branch "main"]
+ 	remote = origin
+-	merge = refs/heads/master
++	merge = refs/heads/main
+diff -ruN xv6-public/.git/HEAD xv6-final/.git/HEAD
+--- xv6-public/.git/HEAD	2021-09-15 20:58:56.710412501 +0530
++++ xv6-final/.git/HEAD	2021-09-15 18:35:48.166104183 +0530
+@@ -1 +1 @@
+-ref: refs/heads/master
++ref: refs/heads/main
+Binary files xv6-public/.git/index and xv6-final/.git/index differ
+diff -ruN xv6-public/.git/logs/HEAD xv6-final/.git/logs/HEAD
+--- xv6-public/.git/logs/HEAD	2021-09-15 20:58:56.710412501 +0530
++++ xv6-final/.git/logs/HEAD	2021-09-15 18:35:48.166104183 +0530
+@@ -1 +1 @@
+-0000000000000000000000000000000000000000 eeb7b415dbcb12cc362d0783e41c3d1f44066b17 Pallav <pallav@pallav-virtual-machine.(none)> 1631719736 +0530	clone: from git://github.com/mit-pdos/xv6-public.git
++0000000000000000000000000000000000000000 2779774c79aec1a3171dc49b566cb676483f91d0 Pallav <pallav@pallav-virtual-machine.(none)> 1631711148 +0530	clone: from git://github.com/Anu8690/xv6-final.git
+diff -ruN xv6-public/.git/logs/refs/heads/main xv6-final/.git/logs/refs/heads/main
+--- xv6-public/.git/logs/refs/heads/main	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/.git/logs/refs/heads/main	2021-09-15 18:35:48.166104183 +0530
+@@ -0,0 +1 @@
++0000000000000000000000000000000000000000 2779774c79aec1a3171dc49b566cb676483f91d0 Pallav <pallav@pallav-virtual-machine.(none)> 1631711148 +0530	clone: from git://github.com/Anu8690/xv6-final.git
+diff -ruN xv6-public/.git/logs/refs/heads/master xv6-final/.git/logs/refs/heads/master
+--- xv6-public/.git/logs/refs/heads/master	2021-09-15 20:58:56.710412501 +0530
++++ xv6-final/.git/logs/refs/heads/master	1970-01-01 05:30:00.000000000 +0530
+@@ -1 +0,0 @@
+-0000000000000000000000000000000000000000 eeb7b415dbcb12cc362d0783e41c3d1f44066b17 Pallav <pallav@pallav-virtual-machine.(none)> 1631719736 +0530	clone: from git://github.com/mit-pdos/xv6-public.git
+diff -ruN xv6-public/.git/logs/refs/remotes/origin/HEAD xv6-final/.git/logs/refs/remotes/origin/HEAD
+--- xv6-public/.git/logs/refs/remotes/origin/HEAD	2021-09-15 20:58:56.710412501 +0530
++++ xv6-final/.git/logs/refs/remotes/origin/HEAD	2021-09-15 18:35:48.166104183 +0530
+@@ -1 +1 @@
+-0000000000000000000000000000000000000000 eeb7b415dbcb12cc362d0783e41c3d1f44066b17 Pallav <pallav@pallav-virtual-machine.(none)> 1631719736 +0530	clone: from git://github.com/mit-pdos/xv6-public.git
++0000000000000000000000000000000000000000 2779774c79aec1a3171dc49b566cb676483f91d0 Pallav <pallav@pallav-virtual-machine.(none)> 1631711148 +0530	clone: from git://github.com/Anu8690/xv6-final.git
+Binary files xv6-public/.git/objects/pack/pack-12ca327ecdd26d679901b04fa869cf247b06c9ef.idx and xv6-final/.git/objects/pack/pack-12ca327ecdd26d679901b04fa869cf247b06c9ef.idx differ
+Binary files xv6-public/.git/objects/pack/pack-12ca327ecdd26d679901b04fa869cf247b06c9ef.pack and xv6-final/.git/objects/pack/pack-12ca327ecdd26d679901b04fa869cf247b06c9ef.pack differ
+Binary files xv6-public/.git/objects/pack/pack-f39b9e2b5fe76ca76b0da88580c3f917fa877644.idx and xv6-final/.git/objects/pack/pack-f39b9e2b5fe76ca76b0da88580c3f917fa877644.idx differ
+Binary files xv6-public/.git/objects/pack/pack-f39b9e2b5fe76ca76b0da88580c3f917fa877644.pack and xv6-final/.git/objects/pack/pack-f39b9e2b5fe76ca76b0da88580c3f917fa877644.pack differ
+diff -ruN xv6-public/.git/packed-refs xv6-final/.git/packed-refs
+--- xv6-public/.git/packed-refs	2021-09-15 20:58:56.710412501 +0530
++++ xv6-final/.git/packed-refs	2021-09-15 18:35:48.162104154 +0530
+@@ -1,28 +1,2 @@
+ # pack-refs with: peeled fully-peeled sorted 
+-eeb7b415dbcb12cc362d0783e41c3d1f44066b17 refs/remotes/origin/master
+-af0e851a3a8a7d13bc2f2d596b58500594040892 refs/tags/osdi12-submit
+-^8286b58087750e09bac3815219e0382a0bb2b159
+-9e698c587b135db17b38a5838976805b9c01e338 refs/tags/symlinks
+-05e0b1218dcebe1f40028531b51926df8ae52be0 refs/tags/xv6-2006
+-^5cc0bd5ceaf805ab44f851e6a3f1952a29e9d7b7
+-42f3c3f7be9717b66ba6e133a113c0f751c53133 refs/tags/xv6-2007
+-adcd16c3f7588b4a28d37495f05e94278c9e3a1e refs/tags/xv6-2008
+-124fe7e457c0dc9b671c7ffccb56004eb61da4f0 refs/tags/xv6-2010
+-5922cdbbcc4fdbd76eec9e0dad9f650e4c86ee99 refs/tags/xv6-rev0
+-^5cc0bd5ceaf805ab44f851e6a3f1952a29e9d7b7
+-81f31a773dd49b001437eaed3975438585ff9911 refs/tags/xv6-rev1
+-^42f3c3f7be9717b66ba6e133a113c0f751c53133
+-b818915f793cd20c5d1e24f668534a9d690f3cc8 refs/tags/xv6-rev11
+-30dab73b68b816877dc8f78504ceca0808c976eb refs/tags/xv6-rev3
+-^074ac7ccd43c08d01a237ce6f14cac10715a51ef
+-113005d48f09a4e3939940d72a77bf6973ea8755 refs/tags/xv6-rev4
+-^124fe7e457c0dc9b671c7ffccb56004eb61da4f0
+-d6aa754494b37e32862b1f78d53deedc53f66a15 refs/tags/xv6-rev5
+-^ae603ff5e79bb7b5eea4147425752f33d29fe558
+-3e9d6413d331b4c912d55bfac253af1629d4bac9 refs/tags/xv6-rev6
+-^e64c661ae8b91bd7e858bb1895bef96e6ac2b4bb
+-ccc25c0fac59067d88af52ad9f3b8cee97c3810a refs/tags/xv6-rev7
+-^2ae8392a5c203a7b1bc5b8bff5eabc8b5eab8972
+-7d6f95e327f1c18570d5dd187e3d92e1aadae2cf refs/tags/xv6-rev8
+-^9ba21267e796eb462a657392906e3cbccaedcc99
+-5bf3fbee00fb27cb8cb4eca72dcd9fc4c288ed71 refs/tags/xv6-rev9
++2779774c79aec1a3171dc49b566cb676483f91d0 refs/remotes/origin/main
+diff -ruN xv6-public/.git/refs/heads/main xv6-final/.git/refs/heads/main
+--- xv6-public/.git/refs/heads/main	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/.git/refs/heads/main	2021-09-15 18:35:48.166104183 +0530
+@@ -0,0 +1 @@
++2779774c79aec1a3171dc49b566cb676483f91d0
+diff -ruN xv6-public/.git/refs/heads/master xv6-final/.git/refs/heads/master
+--- xv6-public/.git/refs/heads/master	2021-09-15 20:58:56.710412501 +0530
++++ xv6-final/.git/refs/heads/master	1970-01-01 05:30:00.000000000 +0530
+@@ -1 +0,0 @@
+-eeb7b415dbcb12cc362d0783e41c3d1f44066b17
+diff -ruN xv6-public/.git/refs/remotes/origin/HEAD xv6-final/.git/refs/remotes/origin/HEAD
+--- xv6-public/.git/refs/remotes/origin/HEAD	2021-09-15 20:58:56.710412501 +0530
++++ xv6-final/.git/refs/remotes/origin/HEAD	2021-09-15 18:35:48.166104183 +0530
+@@ -1 +1 @@
+-ref: refs/remotes/origin/master
++ref: refs/remotes/origin/main
+diff -ruN xv6-public/Makefile xv6-final/Makefile
+--- xv6-public/Makefile	2021-09-15 20:58:56.714412530 +0530
++++ xv6-final/Makefile	2021-09-15 18:35:48.178104270 +0530
+@@ -71,12 +71,17 @@
+ 	echo "***" 1>&2; exit 1)
+ endif
+ 
++# ifndef SCHEDFLAG
++# SCHEDFLAG := DEFAULT
++# endif
++
+ CC = $(TOOLPREFIX)gcc
+ AS = $(TOOLPREFIX)gas
+ LD = $(TOOLPREFIX)ld
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+ CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
++# CFLAGS += -D $(SCHEDFLAG)
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+diff -ruN xv6-public/proc.c xv6-final/proc.c
+--- xv6-public/proc.c	2021-09-15 20:58:56.722412588 +0530
++++ xv6-final/proc.c	2021-09-15 18:35:48.190104357 +0530
+@@ -88,7 +88,7 @@
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
+-
++  p->ctime = ticks;
+   release(&ptable.lock);
+ 
+   // Allocate kernel stack.
+@@ -532,3 +532,25 @@
+     cprintf("\n");
+   }
+ }
++
++
++void updatestatistics() {
++  struct proc *p;
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    switch(p->state) {
++      case SLEEPING:
++        p->stime++;
++        break;
++      case RUNNABLE:
++        p->retime++;
++        break;
++      case RUNNING:
++        p->rutime++;
++        break;
++      default:
++        ;
++    }
++  }
++  release(&ptable.lock);
++}
+diff -ruN xv6-public/proc.h xv6-final/proc.h
+--- xv6-public/proc.h	2021-09-15 20:58:56.722412588 +0530
++++ xv6-final/proc.h	2021-09-15 18:35:48.190104357 +0530
+@@ -49,8 +49,15 @@
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  
++  uint ctime;                   // Process creation time
++  int stime;                   //process SLEEPING time
++  int retime;                  //process READY(RUNNABLE) time
++  int rutime;                  //process RUNNING time
+ };
+ 
++
++void updatestatistics();
+ // Process memory is laid out contiguously, low addresses first:
+ //   text
+ //   original data and bss
+diff -ruN xv6-public/sh.c xv6-final/sh.c
+--- xv6-public/sh.c	2021-09-15 20:58:56.722412588 +0530
++++ xv6-final/sh.c	2021-09-15 18:35:48.190104357 +0530
+@@ -3,6 +3,7 @@
+ #include "types.h"
+ #include "user.h"
+ #include "fcntl.h"
++#include "console.h"
+ 
+ // Parsed command representation
+ #define EXEC  1
+@@ -53,6 +54,21 @@
+ void panic(char*);
+ struct cmd *parsecmd(char*);
+ 
++char cmdFromHistory[INPUT_BUF];//this is the buffer that will get the current history command from history
++
++/*
++  this the function the calls to the different history indexes
++*/
++void history1() {
++  int i, count = 0;
++  for (i = 0; i < MAX_HISTORY; i++) {
++    if (history(cmdFromHistory, MAX_HISTORY-i-1) == 0) { //this is the sys call
++      count++;
++      printf(1, " %d: %s\n", count, cmdFromHistory);
++    }
++  }
++}
++
+ // Execute cmd.  Never returns.
+ void
+ runcmd(struct cmd *cmd)
+@@ -144,9 +160,9 @@
+ int
+ main(void)
+ {
+-  static char buf[100];
++  static char buf[INPUT_BUF];
+   int fd;
+-
++  int retime, rutime, stime,pid;
+   // Ensure that three file descriptors are open.
+   while((fd = open("console", O_RDWR)) >= 0){
+     if(fd >= 3){
+@@ -154,7 +170,7 @@
+       break;
+     }
+   }
+-
++  
+   // Read and run input commands.
+   while(getcmd(buf, sizeof(buf)) >= 0){
+     if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
+@@ -164,9 +180,21 @@
+         printf(2, "cannot cd %s\n", buf+3);
+       continue;
+     }
++    if(buf[0] == 'h' && buf[1] == 'i' && buf[2] == 's' && buf[3] == 't' && buf[4] == 'o' && buf[5] == 'r' && buf[6] == 'y' && buf[7] == '\n') {
++      history1();
++      continue;
++    }
++    // if (buf[0] == 'g' && buf[1] == 'e' && buf[2] == 't' && buf[3] == 'p'
++    //     && buf[4] == 'i' && buf[5] == 'd') {
++    //   printf(1, "Process ID: %d\n", getpid());
++    //   continue;
++    // }
+     if(fork1() == 0)
+       runcmd(parsecmd(buf));
+-    wait();
++    else {
++  		pid=wait2(&retime, &rutime, &stime);
++  		printf(1, "pid:%d retime:%d rutime:%d stime:%d\n", pid, retime, rutime, stime);
++  	}
+   }
+   exit();
+ }
+@@ -491,3 +519,4 @@
+   }
+   return cmd;
+ }
++
+diff -ruN xv6-public/syscall.c xv6-final/syscall.c
+--- xv6-public/syscall.c	2021-09-15 20:58:56.726412618 +0530
++++ xv6-final/syscall.c	2021-09-15 18:35:48.194104386 +0530
+@@ -103,6 +103,8 @@
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_history(void);
++extern int sys_wait2(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +128,8 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_history]   sys_history,
++[SYS_wait2] sys_wait2
+ };
+ 
+ void
+@@ -143,3 +147,4 @@
+     curproc->tf->eax = -1;
+   }
+ }
++
+diff -ruN xv6-public/syscall.h xv6-final/syscall.h
+--- xv6-public/syscall.h	2021-09-15 20:58:56.726412618 +0530
++++ xv6-final/syscall.h	2021-09-15 18:35:48.194104386 +0530
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_history  22
++#define SYS_wait2 23
+diff -ruN xv6-public/sysproc.c xv6-final/sysproc.c
+--- xv6-public/sysproc.c	2021-09-15 20:58:56.726412618 +0530
++++ xv6-final/sysproc.c	2021-09-15 18:35:48.194104386 +0530
+@@ -6,6 +6,7 @@
+ #include "memlayout.h"
+ #include "mmu.h"
+ #include "proc.h"
++#include "console.h"
+ 
+ int
+ sys_fork(void)
+@@ -89,3 +90,31 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++/*
++  this is the actual function being called from syscall.c
++  @returns - 0 if suceeded, 1 if no history in the historyId given, 2 if illgal history id
++*/
++int sys_history(void) {
++  char *buffer;
++  int historyId;
++  argptr(0, &buffer, 1);
++  argint(1, &historyId);
++  return history(buffer, historyId);
++}
++
++
++int sys_wait2(void) {
++  int res;
++  int retime = 0;
++  int rutime = 0;
++  int stime = 0;
++  argint(0, &retime);
++  argint(1, &rutime);
++  argint(2, &stime);
++  res = sys_wait();
++  *(int*)retime = myproc()->retime;
++  *(int*)rutime = myproc()->rutime;
++  *(int*)stime = myproc()->stime;
++  return res;
++}
+diff -ruN xv6-public/trap.c xv6-final/trap.c
+--- xv6-public/trap.c	2021-09-15 20:58:56.726412618 +0530
++++ xv6-final/trap.c	2021-09-15 18:35:48.194104386 +0530
+@@ -51,6 +51,7 @@
+     if(cpuid() == 0){
+       acquire(&tickslock);
+       ticks++;
++      updatestatistics();
+       wakeup(&ticks);
+       release(&tickslock);
+     }
+diff -ruN xv6-public/user.h xv6-final/user.h
+--- xv6-public/user.h	2021-09-15 20:58:56.726412618 +0530
++++ xv6-final/user.h	2021-09-15 18:35:48.194104386 +0530
+@@ -23,6 +23,8 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int history(char*, int);
++int wait2(int*, int*, int*);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+@@ -37,3 +39,4 @@
+ void* malloc(uint);
+ void free(void*);
+ int atoi(const char*);
++
+diff -ruN xv6-public/usys.S xv6-final/usys.S
+--- xv6-public/usys.S	2021-09-15 20:58:56.726412618 +0530
++++ xv6-final/usys.S	2021-09-15 18:35:48.194104386 +0530
+@@ -29,3 +29,5 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(history)
++SYSCALL(wait2)

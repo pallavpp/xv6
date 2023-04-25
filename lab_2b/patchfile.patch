@@ -1,0 +1,4328 @@
+diff -ruN xv6-public/console.c xv6-final/console.c
+--- xv6-public/console.c	2021-09-28 19:25:28.150489000 +0530
++++ xv6-final/console.c	2021-09-30 16:57:07.552541000 +0530
+@@ -14,6 +14,14 @@
+ #include "mmu.h"
+ #include "proc.h"
+ #include "x86.h"
++#include "console.h"
++
++// ---------------------------------------------------------------
++#define UP_ARROW 226
++#define DOWN_ARROW 227
++#define LEFT_ARROW 228
++#define RIGHT_ARROW 229
++// ---------------------------------------------------------------
+ 
+ static void consputc(int);
+ 
+@@ -139,12 +147,26 @@
+   outb(CRTPORT, 15);
+   pos |= inb(CRTPORT+1);
+ 
+-  if(c == '\n')
+-    pos += 80 - pos%80;
+-  else if(c == BACKSPACE){
+-    if(pos > 0) --pos;
+-  } else
+-    crt[pos++] = (c&0xff) | 0x0700;  // black on white
++  // if(c == '\n')
++  //   pos += 80 - pos%80;
++  // else if(c == BACKSPACE){
++  //   if(pos > 0) --pos;
++  // } else
++  //   crt[pos++] = (c&0xff) | 0x0700;  // black on white
++
++  switch(c) {
++    case '\n':
++      pos += 80 - pos%80;
++      break;   
++    case BACKSPACE:
++      if(pos > 0) --pos;
++      break;
++    case LEFT_ARROW:
++      if(pos > 0) --pos;
++      break;
++    default:
++      crt[pos++] = (c&0xff) | 0x0700;  // black on white
++  }
+ 
+   if(pos < 0 || pos > 25*80)
+     panic("pos under/overflow");
+@@ -159,7 +181,9 @@
+   outb(CRTPORT+1, pos>>8);
+   outb(CRTPORT, 15);
+   outb(CRTPORT+1, pos);
+-  crt[pos] = ' ' | 0x0700;
++  // crt[pos] = ' ' | 0x0700;
++  if (c == BACKSPACE)
++    crt[pos] = ' ' | 0x0700;
+ }
+ 
+ void
+@@ -173,26 +197,101 @@
+ 
+   if(c == BACKSPACE){
+     uartputc('\b'); uartputc(' '); uartputc('\b');
+-  } else
++  } else if(c == LEFT_ARROW){
++    uartputc('\b');
++  } else {
+     uartputc(c);
++  }
++  
+   cgaputc(c);
+ }
+ 
+ #define INPUT_BUF 128
+ struct {
+   char buf[INPUT_BUF];
+-  uint r;  // Read index
+-  uint w;  // Write index
+-  uint e;  // Edit index
++  uint r;  // Read index, exec will start reading the command from here
++  uint w;  // Write index, exec will finish reading the command here
++  uint e;  // Edit index, current caret position
++  uint rightmost; // the first empty char in the line
+ } input;
+ 
++char charsToBeMoved[INPUT_BUF];  // temporary storage for input.buf in a certain context
++char buf2[INPUT_BUF];
++
++/*
++  this struct will hold the history buffer array
++*/
++struct {
++  char bufferArr[MAX_HISTORY][INPUT_BUF]; //holds the actual command strings -
++  uint lengthsArr[MAX_HISTORY]; // this will hold the length of each command string
++  uint lastCommandIndex;  //the index of the last command entered to history
++  int numOfCommmandsInMem; //number of history commands in mem
++  int currentHistory;//this will hold the current history view (the oldest will be MAX_HISTORY-1)
++} historyBufferArray;
++
++char oldBuf[INPUT_BUF];// this will hold the details of the command that was written before accessing the history
++uint lengthOfOldBuf;
++
+ #define C(x)  ((x)-'@')  // Control-x
+ 
++/*
++Copy input.buf to a safe location. Used only when punching in new keys and the
++caret isn't at the end of the line.
++*/
++void copyCharsToBeMoved() {
++  uint n = input.rightmost - input.e;
++  uint i;
++  for (i = 0; i < n; i++)
++    charsToBeMoved[i] = input.buf[(input.e + i) % INPUT_BUF];
++}
++
++/*
++Shift input.buf one byte to the right, and repaint the chars on-screen. Used
++Used only when punching in new keys and the caret isn't at the end of the line.
++*/
++void shiftbufright() {
++  uint n = input.rightmost - input.e;
++  int i;
++  for (i = 0; i < n; i++) {
++
++    char c = charsToBeMoved[i];
++    input.buf[(input.e + i) % INPUT_BUF] = c;
++    consputc(c);
++  }
++  // reset charsToBeMoved for future use
++  memset(charsToBeMoved, '\0', INPUT_BUF);
++  // return the caret to its correct position
++  for (i = 0; i < n; i++) {
++    consputc(LEFT_ARROW);
++  }
++}
++
++/*
++Shift input.buf one byte to the left, and repaint the chars on-screen. Used
++Used only when punching in BACKSPACE and the caret isn't at the end of the line.
++*/
++void shiftbufleft() {
++  uint n = input.rightmost - input.e;
++  uint i;
++  consputc(LEFT_ARROW);
++  input.e--;
++  for (i = 0; i < n; i++) {
++    char c = input.buf[(input.e + i + 1) % INPUT_BUF];
++    input.buf[(input.e + i) % INPUT_BUF] = c;
++    consputc(c);
++  }
++  input.rightmost--;
++  consputc(' '); // delete the last char in line
++  for (i = 0; i <= n; i++) {
++    consputc(LEFT_ARROW); // shift the caret back to the left
++  }
++}
++
+ void
+ consoleintr(int (*getc)(void))
+ {
+   int c, doprocdump = 0;
+-
++  uint tempIndex;
+   acquire(&cons.lock);
+   while((c = getc()) >= 0){
+     switch(c){
+@@ -201,27 +300,126 @@
+       doprocdump = 1;
+       break;
+     case C('U'):  // Kill line.
+-      while(input.e != input.w &&
+-            input.buf[(input.e-1) % INPUT_BUF] != '\n'){
+-        input.e--;
+-        consputc(BACKSPACE);
++      if (input.rightmost > input.e) { // caret isn't at the end of the line
++        uint numtoshift = input.rightmost - input.e;
++        uint placestoshift = input.e - input.w;
++        uint i;
++        for (i = 0; i < placestoshift; i++) {
++          consputc(LEFT_ARROW);
++        }
++        memset(buf2, '\0', INPUT_BUF);
++        for (i = 0; i < numtoshift; i++) {
++          buf2[i] = input.buf[(input.w + i + placestoshift) % INPUT_BUF];
++        }
++        for (i = 0; i < numtoshift; i++) {
++          input.buf[(input.w + i) % INPUT_BUF] = buf2[i];
++        }
++        input.e -= placestoshift;
++        input.rightmost -= placestoshift;
++        for (i = 0; i < numtoshift; i++) { // repaint the chars
++          consputc(input.buf[(input.e + i) % INPUT_BUF]);
++        }
++        for (i = 0; i < placestoshift; i++) { // erase the leftover chars
++          consputc(' ');
++        }
++        for (i = 0; i < placestoshift + numtoshift; i++) { // move the caret back to the left
++          consputc(LEFT_ARROW);
++        }
++      }
++      else { // caret is at the end of the line -                                       ( deleting everything from both screen and inputbuf)
++        while(input.e != input.w &&
++              input.buf[(input.e - 1) % INPUT_BUF] != '\n'){
++          input.e--;
++          input.rightmost--;
++          consputc(BACKSPACE);
++        }
+       }
+       break;
+     case C('H'): case '\x7f':  // Backspace
+-      if(input.e != input.w){
++      if (input.rightmost != input.e && input.e != input.w) { // caret isn't at the end of the line
++        shiftbufleft();
++        break;
++      }
++      if(input.e != input.w){ // caret is at the end of the line - deleting last char
+         input.e--;
++        input.rightmost--;
+         consputc(BACKSPACE);
+       }
+       break;
++    case LEFT_ARROW:
++      if (input.e != input.w) {
++        input.e--;
++        consputc(c);
++      }
++      break;
++    case RIGHT_ARROW:
++      if (input.e < input.rightmost) {
++        consputc(input.buf[input.e % INPUT_BUF]);
++        input.e++;
++      }
++      else if (input.e == input.rightmost){
++        consputc(' ');
++        consputc(LEFT_ARROW);
++      }
++      break;
++    case UP_ARROW:
++      if (historyBufferArray.currentHistory < historyBufferArray.numOfCommmandsInMem-1 ){ // current history means the oldest possible will be MAX_HISTORY-1
++        earaseCurrentLineOnScreen();
++        if (historyBufferArray.currentHistory == -1)
++            copyCharsToBeMovedToOldBuf();
++        earaseContentOnInputBuf();
++        historyBufferArray.currentHistory++;
++        tempIndex = (historyBufferArray.lastCommandIndex + historyBufferArray.currentHistory) %MAX_HISTORY;
++        copyBufferToScreen(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
++        copyBufferToInputBuf(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
++      }
++      break;
++    case DOWN_ARROW:
++      switch(historyBufferArray.currentHistory){
++        case -1:
++          //does nothing
++          break;
++        case 0: //get string from old buf
++          earaseCurrentLineOnScreen();
++          copyBufferToInputBuf(oldBuf, lengthOfOldBuf);
++          copyBufferToScreen(oldBuf, lengthOfOldBuf);
++          historyBufferArray.currentHistory--;
++          break;
++        default:
++          earaseCurrentLineOnScreen();
++          historyBufferArray.currentHistory--;
++          tempIndex = (historyBufferArray.lastCommandIndex + historyBufferArray.currentHistory)%MAX_HISTORY;
++          copyBufferToScreen(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
++          copyBufferToInputBuf(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
++          break;
++      }
++      break;
++    // case '\r':
++    //   input.e = input.rightmost;
+     default:
+       if(c != 0 && input.e-input.r < INPUT_BUF){
+         c = (c == '\r') ? '\n' : c;
+-        input.buf[input.e++ % INPUT_BUF] = c;
+-        consputc(c);
+-        if(c == '\n' || c == C('D') || input.e == input.r+INPUT_BUF){
+-          input.w = input.e;
++        if(c == '\n' || c == C('D') || input.rightmost == input.r + INPUT_BUF - 1){
++          input.buf[input.rightmost++ % INPUT_BUF] = c;
++          consputc(c);
++          saveCommandInHistory();
++          input.w = input.e = input.rightmost;
+           wakeup(&input.r);
+         }
++        else {
++          if (input.rightmost > input.e) { // caret isn't at the end of the line
++            copyCharsToBeMoved();
++            input.buf[input.e++ % INPUT_BUF] = c;
++            input.rightmost++;
++            consputc(c);
++            shiftbufright();
++          }
++          else {
++            input.buf[input.e++ % INPUT_BUF] = c;
++            input.rightmost = input.e - input.rightmost == 1 ? input.e : input.rightmost;
++            consputc(c);
++          }
++        }
+       }
+       break;
+     }
+@@ -232,6 +430,101 @@
+   }
+ }
+ 
++/*
++  this method eareases the current line from screen
++*/
++void
++earaseCurrentLineOnScreen(void){
++    uint numToEarase = input.rightmost - input.r;
++    uint i,j;
++    for(j = 0;j<input.rightmost-input.e;j++){
++      consputc(RIGHT_ARROW);
++    }
++    for (i = 0; i < numToEarase; i++) {
++      consputc(BACKSPACE);
++    }
++}
++
++/*
++  this method copies the chars currently on display (and on Input.buf) to oldBuf and save its length on current_history_viewed.lengthOld
++*/
++void
++copyCharsToBeMovedToOldBuf(void){
++    lengthOfOldBuf = input.rightmost - input.r;
++    uint i;
++    for (i = 0; i < lengthOfOldBuf; i++) {
++        oldBuf[i] = input.buf[(input.r+i)%INPUT_BUF];
++    }
++}
++
++/*
++  this method earase all the content of the current command on the inputbuf
++*/
++void
++earaseContentOnInputBuf(){
++  input.rightmost = input.r;
++  input.e = input.r;
++}
++
++/*
++  this method will print the given buf on the screen
++*/
++void
++copyBufferToScreen(char * bufToPrintOnScreen, uint length){
++  uint i;
++  for (i = 0; i < length; i++) {
++    consputc(bufToPrintOnScreen[i]);
++  }
++}
++
++/*
++  this method will copy the given buf to Input.buf
++  will set the input.e and input.rightmost
++  assumes input.r=input.w=input.rightmost=input.e
++*/
++void
++copyBufferToInputBuf(char * bufToSaveInInput, uint length){
++  uint i;
++  for (i = 0; i < length; i++) {
++    input.buf[(input.r+i)%INPUT_BUF] = bufToSaveInInput[i];
++  }
++  input.e = input.r+length;
++  input.rightmost = input.e;
++}
++
++/*
++  this method copies the current command in the input.buf to the saved history
++  @param length - length of command to be saved
++*/
++void
++saveCommandInHistory(){
++  historyBufferArray.currentHistory= -1;//reseting the users history current viewed
++  if (historyBufferArray.numOfCommmandsInMem < MAX_HISTORY)
++    historyBufferArray.numOfCommmandsInMem++; //when we get to MAX_HISTORY commands in memory we keep on inserting to the array in a circular mution
++  uint l = input.rightmost-input.r -1;
++  historyBufferArray.lastCommandIndex = (historyBufferArray.lastCommandIndex - 1)%MAX_HISTORY;
++  historyBufferArray.lengthsArr[historyBufferArray.lastCommandIndex] = l;
++  uint i;
++  for (i = 0; i < l; i++) { //do not want to save in memory the last char '/n'
++    historyBufferArray.bufferArr[historyBufferArray.lastCommandIndex][i] =  input.buf[(input.r+i)%INPUT_BUF];
++  }
++
++}
++
++/*
++  this is the function that gets called by the sys_history and writes the requested command history in the buffer
++*/
++int history(char *buffer, int historyId) {
++  if (historyId < 0 || historyId > MAX_HISTORY - 1)
++    return -2;
++  if (historyId >= historyBufferArray.numOfCommmandsInMem )
++    return -1;
++  memset(buffer, '\0', INPUT_BUF);
++  int tempIndex = (historyBufferArray.lastCommandIndex + historyId) % MAX_HISTORY;
++  memmove(buffer, historyBufferArray.bufferArr[tempIndex], historyBufferArray.lengthsArr[tempIndex]);
++  return 0;
++}
++
+ int
+ consoleread(struct inode *ip, char *dst, int n)
+ {
+@@ -296,4 +589,3 @@
+ 
+   ioapicenable(IRQ_KBD, 0);
+ }
+-
+diff -ruN xv6-public/console.c.orig xv6-final/console.c.orig
+--- xv6-public/console.c.orig	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/console.c.orig	2021-09-30 16:57:07.552541000 +0530
+@@ -0,0 +1,591 @@
++// Console input and output.
++// Input is from the keyboard or serial port.
++// Output is written to the screen and serial port.
++
++#include "types.h"
++#include "defs.h"
++#include "param.h"
++#include "traps.h"
++#include "spinlock.h"
++#include "sleeplock.h"
++#include "fs.h"
++#include "file.h"
++#include "memlayout.h"
++#include "mmu.h"
++#include "proc.h"
++#include "x86.h"
++#include "console.h"
++
++// ---------------------------------------------------------------
++#define UP_ARROW 226
++#define DOWN_ARROW 227
++#define LEFT_ARROW 228
++#define RIGHT_ARROW 229
++// ---------------------------------------------------------------
++
++static void consputc(int);
++
++static int panicked = 0;
++
++static struct {
++  struct spinlock lock;
++  int locking;
++} cons;
++
++static void
++printint(int xx, int base, int sign)
++{
++  static char digits[] = "0123456789abcdef";
++  char buf[16];
++  int i;
++  uint x;
++
++  if(sign && (sign = xx < 0))
++    x = -xx;
++  else
++    x = xx;
++
++  i = 0;
++  do{
++    buf[i++] = digits[x % base];
++  }while((x /= base) != 0);
++
++  if(sign)
++    buf[i++] = '-';
++
++  while(--i >= 0)
++    consputc(buf[i]);
++}
++//PAGEBREAK: 50
++
++// Print to the console. only understands %d, %x, %p, %s.
++void
++cprintf(char *fmt, ...)
++{
++  int i, c, locking;
++  uint *argp;
++  char *s;
++
++  locking = cons.locking;
++  if(locking)
++    acquire(&cons.lock);
++
++  if (fmt == 0)
++    panic("null fmt");
++
++  argp = (uint*)(void*)(&fmt + 1);
++  for(i = 0; (c = fmt[i] & 0xff) != 0; i++){
++    if(c != '%'){
++      consputc(c);
++      continue;
++    }
++    c = fmt[++i] & 0xff;
++    if(c == 0)
++      break;
++    switch(c){
++    case 'd':
++      printint(*argp++, 10, 1);
++      break;
++    case 'x':
++    case 'p':
++      printint(*argp++, 16, 0);
++      break;
++    case 's':
++      if((s = (char*)*argp++) == 0)
++        s = "(null)";
++      for(; *s; s++)
++        consputc(*s);
++      break;
++    case '%':
++      consputc('%');
++      break;
++    default:
++      // Print unknown % sequence to draw attention.
++      consputc('%');
++      consputc(c);
++      break;
++    }
++  }
++
++  if(locking)
++    release(&cons.lock);
++}
++
++void
++panic(char *s)
++{
++  int i;
++  uint pcs[10];
++
++  cli();
++  cons.locking = 0;
++  // use lapiccpunum so that we can call panic from mycpu()
++  cprintf("lapicid %d: panic: ", lapicid());
++  cprintf(s);
++  cprintf("\n");
++  getcallerpcs(&s, pcs);
++  for(i=0; i<10; i++)
++    cprintf(" %p", pcs[i]);
++  panicked = 1; // freeze other CPU
++  for(;;)
++    ;
++}
++
++//PAGEBREAK: 50
++#define BACKSPACE 0x100
++#define CRTPORT 0x3d4
++static ushort *crt = (ushort*)P2V(0xb8000);  // CGA memory
++
++static void
++cgaputc(int c)
++{
++  int pos;
++
++  // Cursor position: col + 80*row.
++  outb(CRTPORT, 14);
++  pos = inb(CRTPORT+1) << 8;
++  outb(CRTPORT, 15);
++  pos |= inb(CRTPORT+1);
++
++  // if(c == '\n')
++  //   pos += 80 - pos%80;
++  // else if(c == BACKSPACE){
++  //   if(pos > 0) --pos;
++  // } else
++  //   crt[pos++] = (c&0xff) | 0x0700;  // black on white
++
++  switch(c) {
++    case '\n':
++      pos += 80 - pos%80;
++      break;   
++    case BACKSPACE:
++      if(pos > 0) --pos;
++      break;
++    case LEFT_ARROW:
++      if(pos > 0) --pos;
++      break;
++    default:
++      crt[pos++] = (c&0xff) | 0x0700;  // black on white
++  }
++
++  if(pos < 0 || pos > 25*80)
++    panic("pos under/overflow");
++
++  if((pos/80) >= 24){  // Scroll up.
++    memmove(crt, crt+80, sizeof(crt[0])*23*80);
++    pos -= 80;
++    memset(crt+pos, 0, sizeof(crt[0])*(24*80 - pos));
++  }
++
++  outb(CRTPORT, 14);
++  outb(CRTPORT+1, pos>>8);
++  outb(CRTPORT, 15);
++  outb(CRTPORT+1, pos);
++  // crt[pos] = ' ' | 0x0700;
++  if (c == BACKSPACE)
++    crt[pos] = ' ' | 0x0700;
++}
++
++void
++consputc(int c)
++{
++  if(panicked){
++    cli();
++    for(;;)
++      ;
++  }
++
++  if(c == BACKSPACE){
++    uartputc('\b'); uartputc(' '); uartputc('\b');
++  } else if(c == LEFT_ARROW){
++    uartputc('\b');
++  } else {
++    uartputc(c);
++  }
++  
++  cgaputc(c);
++}
++
++#define INPUT_BUF 128
++struct {
++  char buf[INPUT_BUF];
++  uint r;  // Read index, exec will start reading the command from here
++  uint w;  // Write index, exec will finish reading the command here
++  uint e;  // Edit index, current caret position
++  uint rightmost; // the first empty char in the line
++} input;
++
++char charsToBeMoved[INPUT_BUF];  // temporary storage for input.buf in a certain context
++char buf2[INPUT_BUF];
++
++/*
++  this struct will hold the history buffer array
++*/
++struct {
++  char bufferArr[MAX_HISTORY][INPUT_BUF]; //holds the actual command strings -
++  uint lengthsArr[MAX_HISTORY]; // this will hold the length of each command string
++  uint lastCommandIndex;  //the index of the last command entered to history
++  int numOfCommmandsInMem; //number of history commands in mem
++  int currentHistory;//this will hold the current history view (the oldest will be MAX_HISTORY-1)
++} historyBufferArray;
++
++char oldBuf[INPUT_BUF];// this will hold the details of the command that was written before accessing the history
++uint lengthOfOldBuf;
++
++#define C(x)  ((x)-'@')  // Control-x
++
++/*
++Copy input.buf to a safe location. Used only when punching in new keys and the
++caret isn't at the end of the line.
++*/
++void copyCharsToBeMoved() {
++  uint n = input.rightmost - input.e;
++  uint i;
++  for (i = 0; i < n; i++)
++    charsToBeMoved[i] = input.buf[(input.e + i) % INPUT_BUF];
++}
++
++/*
++Shift input.buf one byte to the right, and repaint the chars on-screen. Used
++Used only when punching in new keys and the caret isn't at the end of the line.
++*/
++void shiftbufright() {
++  uint n = input.rightmost - input.e;
++  int i;
++  for (i = 0; i < n; i++) {
++
++    char c = charsToBeMoved[i];
++    input.buf[(input.e + i) % INPUT_BUF] = c;
++    consputc(c);
++  }
++  // reset charsToBeMoved for future use
++  memset(charsToBeMoved, '\0', INPUT_BUF);
++  // return the caret to its correct position
++  for (i = 0; i < n; i++) {
++    consputc(LEFT_ARROW);
++  }
++}
++
++/*
++Shift input.buf one byte to the left, and repaint the chars on-screen. Used
++Used only when punching in BACKSPACE and the caret isn't at the end of the line.
++*/
++void shiftbufleft() {
++  uint n = input.rightmost - input.e;
++  uint i;
++  consputc(LEFT_ARROW);
++  input.e--;
++  for (i = 0; i < n; i++) {
++    char c = input.buf[(input.e + i + 1) % INPUT_BUF];
++    input.buf[(input.e + i) % INPUT_BUF] = c;
++    consputc(c);
++  }
++  input.rightmost--;
++  consputc(' '); // delete the last char in line
++  for (i = 0; i <= n; i++) {
++    consputc(LEFT_ARROW); // shift the caret back to the left
++  }
++}
++
++void
++consoleintr(int (*getc)(void))
++{
++  int c, doprocdump = 0;
++  uint tempIndex;
++  acquire(&cons.lock);
++  while((c = getc()) >= 0){
++    switch(c){
++    case C('P'):  // Process listing.
++      // procdump() locks cons.lock indirectly; invoke later
++      doprocdump = 1;
++      break;
++    case C('U'):  // Kill line.
++      if (input.rightmost > input.e) { // caret isn't at the end of the line
++        uint numtoshift = input.rightmost - input.e;
++        uint placestoshift = input.e - input.w;
++        uint i;
++        for (i = 0; i < placestoshift; i++) {
++          consputc(LEFT_ARROW);
++        }
++        memset(buf2, '\0', INPUT_BUF);
++        for (i = 0; i < numtoshift; i++) {
++          buf2[i] = input.buf[(input.w + i + placestoshift) % INPUT_BUF];
++        }
++        for (i = 0; i < numtoshift; i++) {
++          input.buf[(input.w + i) % INPUT_BUF] = buf2[i];
++        }
++        input.e -= placestoshift;
++        input.rightmost -= placestoshift;
++        for (i = 0; i < numtoshift; i++) { // repaint the chars
++          consputc(input.buf[(input.e + i) % INPUT_BUF]);
++        }
++        for (i = 0; i < placestoshift; i++) { // erase the leftover chars
++          consputc(' ');
++        }
++        for (i = 0; i < placestoshift + numtoshift; i++) { // move the caret back to the left
++          consputc(LEFT_ARROW);
++        }
++      }
++      else { // caret is at the end of the line -                                       ( deleting everything from both screen and inputbuf)
++        while(input.e != input.w &&
++              input.buf[(input.e - 1) % INPUT_BUF] != '\n'){
++          input.e--;
++          input.rightmost--;
++          consputc(BACKSPACE);
++        }
++      }
++      break;
++    case C('H'): case '\x7f':  // Backspace
++      if (input.rightmost != input.e && input.e != input.w) { // caret isn't at the end of the line
++        shiftbufleft();
++        break;
++      }
++      if(input.e != input.w){ // caret is at the end of the line - deleting last char
++        input.e--;
++        input.rightmost--;
++        consputc(BACKSPACE);
++      }
++      break;
++    case LEFT_ARROW:
++      if (input.e != input.w) {
++        input.e--;
++        consputc(c);
++      }
++      break;
++    case RIGHT_ARROW:
++      if (input.e < input.rightmost) {
++        consputc(input.buf[input.e % INPUT_BUF]);
++        input.e++;
++      }
++      else if (input.e == input.rightmost){
++        consputc(' ');
++        consputc(LEFT_ARROW);
++      }
++      break;
++    case UP_ARROW:
++      if (historyBufferArray.currentHistory < historyBufferArray.numOfCommmandsInMem-1 ){ // current history means the oldest possible will be MAX_HISTORY-1
++        earaseCurrentLineOnScreen();
++        if (historyBufferArray.currentHistory == -1)
++            copyCharsToBeMovedToOldBuf();
++        earaseContentOnInputBuf();
++        historyBufferArray.currentHistory++;
++        tempIndex = (historyBufferArray.lastCommandIndex + historyBufferArray.currentHistory) %MAX_HISTORY;
++        copyBufferToScreen(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
++        copyBufferToInputBuf(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
++      }
++      break;
++    case DOWN_ARROW:
++      switch(historyBufferArray.currentHistory){
++        case -1:
++          //does nothing
++          break;
++        case 0: //get string from old buf
++          earaseCurrentLineOnScreen();
++          copyBufferToInputBuf(oldBuf, lengthOfOldBuf);
++          copyBufferToScreen(oldBuf, lengthOfOldBuf);
++          historyBufferArray.currentHistory--;
++          break;
++        default:
++          earaseCurrentLineOnScreen();
++          historyBufferArray.currentHistory--;
++          tempIndex = (historyBufferArray.lastCommandIndex + historyBufferArray.currentHistory)%MAX_HISTORY;
++          copyBufferToScreen(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
++          copyBufferToInputBuf(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
++          break;
++      }
++      break;
++    // case '\r':
++    //   input.e = input.rightmost;
++    default:
++      if(c != 0 && input.e-input.r < INPUT_BUF){
++        c = (c == '\r') ? '\n' : c;
++        if(c == '\n' || c == C('D') || input.rightmost == input.r + INPUT_BUF - 1){
++          input.buf[input.rightmost++ % INPUT_BUF] = c;
++          consputc(c);
++          saveCommandInHistory();
++          input.w = input.e = input.rightmost;
++          wakeup(&input.r);
++        }
++        else {
++          if (input.rightmost > input.e) { // caret isn't at the end of the line
++            copyCharsToBeMoved();
++            input.buf[input.e++ % INPUT_BUF] = c;
++            input.rightmost++;
++            consputc(c);
++            shiftbufright();
++          }
++          else {
++            input.buf[input.e++ % INPUT_BUF] = c;
++            input.rightmost = input.e - input.rightmost == 1 ? input.e : input.rightmost;
++            consputc(c);
++          }
++        }
++      }
++      break;
++    }
++  }
++  release(&cons.lock);
++  if(doprocdump) {
++    procdump();  // now call procdump() wo. cons.lock held
++  }
++}
++
++/*
++  this method eareases the current line from screen
++*/
++void
++earaseCurrentLineOnScreen(void){
++    uint numToEarase = input.rightmost - input.r;
++    uint i,j;
++    for(j = 0;j<input.rightmost-input.e;j++){
++      consputc(RIGHT_ARROW);
++    }
++    for (i = 0; i < numToEarase; i++) {
++      consputc(BACKSPACE);
++    }
++}
++
++/*
++  this method copies the chars currently on display (and on Input.buf) to oldBuf and save its length on current_history_viewed.lengthOld
++*/
++void
++copyCharsToBeMovedToOldBuf(void){
++    lengthOfOldBuf = input.rightmost - input.r;
++    uint i;
++    for (i = 0; i < lengthOfOldBuf; i++) {
++        oldBuf[i] = input.buf[(input.r+i)%INPUT_BUF];
++    }
++}
++
++/*
++  this method earase all the content of the current command on the inputbuf
++*/
++void
++earaseContentOnInputBuf(){
++  input.rightmost = input.r;
++  input.e = input.r;
++}
++
++/*
++  this method will print the given buf on the screen
++*/
++void
++copyBufferToScreen(char * bufToPrintOnScreen, uint length){
++  uint i;
++  for (i = 0; i < length; i++) {
++    consputc(bufToPrintOnScreen[i]);
++  }
++}
++
++/*
++  this method will copy the given buf to Input.buf
++  will set the input.e and input.rightmost
++  assumes input.r=input.w=input.rightmost=input.e
++*/
++void
++copyBufferToInputBuf(char * bufToSaveInInput, uint length){
++  uint i;
++  for (i = 0; i < length; i++) {
++    input.buf[(input.r+i)%INPUT_BUF] = bufToSaveInInput[i];
++  }
++  input.e = input.r+length;
++  input.rightmost = input.e;
++}
++
++/*
++  this method copies the current command in the input.buf to the saved history
++  @param length - length of command to be saved
++*/
++void
++saveCommandInHistory(){
++  historyBufferArray.currentHistory= -1;//reseting the users history current viewed
++  if (historyBufferArray.numOfCommmandsInMem < MAX_HISTORY)
++    historyBufferArray.numOfCommmandsInMem++; //when we get to MAX_HISTORY commands in memory we keep on inserting to the array in a circular mution
++  uint l = input.rightmost-input.r -1;
++  historyBufferArray.lastCommandIndex = (historyBufferArray.lastCommandIndex - 1)%MAX_HISTORY;
++  historyBufferArray.lengthsArr[historyBufferArray.lastCommandIndex] = l;
++  uint i;
++  for (i = 0; i < l; i++) { //do not want to save in memory the last char '/n'
++    historyBufferArray.bufferArr[historyBufferArray.lastCommandIndex][i] =  input.buf[(input.r+i)%INPUT_BUF];
++  }
++
++}
++
++/*
++  this is the function that gets called by the sys_history and writes the requested command history in the buffer
++*/
++int history(char *buffer, int historyId) {
++  if (historyId < 0 || historyId > MAX_HISTORY - 1)
++    return -2;
++  if (historyId >= historyBufferArray.numOfCommmandsInMem )
++    return -1;
++  memset(buffer, '\0', INPUT_BUF);
++  int tempIndex = (historyBufferArray.lastCommandIndex + historyId) % MAX_HISTORY;
++  memmove(buffer, historyBufferArray.bufferArr[tempIndex], historyBufferArray.lengthsArr[tempIndex]);
++  return 0;
++}
++
++int
++consoleread(struct inode *ip, char *dst, int n)
++{
++  uint target;
++  int c;
++
++  iunlock(ip);
++  target = n;
++  acquire(&cons.lock);
++  while(n > 0){
++    while(input.r == input.w){
++      if(myproc()->killed){
++        release(&cons.lock);
++        ilock(ip);
++        return -1;
++      }
++      sleep(&input.r, &cons.lock);
++    }
++    c = input.buf[input.r++ % INPUT_BUF];
++    if(c == C('D')){  // EOF
++      if(n < target){
++        // Save ^D for next time, to make sure
++        // caller gets a 0-byte result.
++        input.r--;
++      }
++      break;
++    }
++    *dst++ = c;
++    --n;
++    if(c == '\n')
++      break;
++  }
++  release(&cons.lock);
++  ilock(ip);
++
++  return target - n;
++}
++
++int
++consolewrite(struct inode *ip, char *buf, int n)
++{
++  int i;
++
++  iunlock(ip);
++  acquire(&cons.lock);
++  for(i = 0; i < n; i++)
++    consputc(buf[i] & 0xff);
++  release(&cons.lock);
++  ilock(ip);
++
++  return n;
++}
++
++void
++consoleinit(void)
++{
++  initlock(&cons.lock, "console");
++
++  devsw[CONSOLE].write = consolewrite;
++  devsw[CONSOLE].read = consoleread;
++  cons.locking = 1;
++
++  ioapicenable(IRQ_KBD, 0);
++}
+diff -ruN xv6-public/console.h xv6-final/console.h
+--- xv6-public/console.h	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/console.h	2021-09-30 16:57:07.552541000 +0530
+@@ -0,0 +1,56 @@
++#include "types.h"
++
++#define UP_ARROW 226
++#define DOWN_ARROW 227
++#define LEFT_ARROW 228
++#define RIGHT_ARROW 229
++
++#define INPUT_BUF 128
++#define BACKSPACE 0x100
++#define CRTPORT 0x3d4
++
++#define MAX_HISTORY 16
++
++/*
++  this method eareases the current line from screen
++*/
++void
++earaseCurrentLineOnScreen(void);
++
++/*
++  this method copies the chars currently on display (and on Input.buf) to oldBuf and save its length on current_history_viewed.lengthOld
++*/
++void
++copyCharsToBeMovedToOldBuf(void);
++
++/*
++  this method earase all the content of the current command on the inputbuf
++*/
++void
++earaseContentOnInputBuf();
++
++/*
++  this method will print the given buf on the screen
++*/
++void
++copyBufferToScreen(char * bufToPrintOnScreen, uint length);
++
++/*
++  this method will copy the given buf to Input.buf
++  will set the input.e and input.rightmost
++  assumes input.r=input.w=input.rightmost=input.e                                                                   
++*/
++void
++copyBufferToInputBuf(char * bufToSaveInInput, uint length);
++
++/*
++  this method copies the current command in the input.buf to the saved history 
++  @param length - length of command to be saved                                                                                 //GILAD QUES who should call this??
++*/
++void
++saveCommandInHistory();
++
++/*
++  this is the function that gets called by the sys_history and writes the requested command history in the buffer
++*/
++int history(char *buffer, int historyId);
+diff -ruN xv6-public/.cvsignore xv6-final/.cvsignore
+--- xv6-public/.cvsignore	2021-09-28 19:25:28.146489000 +0530
++++ xv6-final/.cvsignore	1970-01-01 05:30:00.000000000 +0530
+@@ -1,16 +0,0 @@
+-*.asm
+-*.d
+-*.sym
+-_*
+-kernel
+-user1
+-userfs
+-usertests
+-xv6.img
+-vectors.S
+-bochsout.txt
+-bootblock
+-bootother
+-bootother.out
+-parport.out
+-fmt
+diff -ruN xv6-public/defs.h xv6-final/defs.h
+--- xv6-public/defs.h	2021-09-28 19:25:28.150489000 +0530
++++ xv6-final/defs.h	2021-09-30 16:57:07.552541000 +0530
+@@ -22,6 +22,7 @@
+ void            consoleintr(int(*)(void));
+ void            panic(char*) __attribute__((noreturn));
+ 
++
+ // exec.c
+ int             exec(char*, char**);
+ 
+@@ -120,7 +121,10 @@
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++int             set_prio(int);
++
+ 
++int wait2(int*, int*, int*);
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+ 
+diff -ruN xv6-public/defs.h.orig xv6-final/defs.h.orig
+--- xv6-public/defs.h.orig	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/defs.h.orig	2021-09-30 16:57:07.552541000 +0530
+@@ -0,0 +1,192 @@
++struct buf;
++struct context;
++struct file;
++struct inode;
++struct pipe;
++struct proc;
++struct rtcdate;
++struct spinlock;
++struct sleeplock;
++struct stat;
++struct superblock;
++
++// bio.c
++void            binit(void);
++struct buf*     bread(uint, uint);
++void            brelse(struct buf*);
++void            bwrite(struct buf*);
++
++// console.c
++void            consoleinit(void);
++void            cprintf(char*, ...);
++void            consoleintr(int(*)(void));
++void            panic(char*) __attribute__((noreturn));
++
++
++// exec.c
++int             exec(char*, char**);
++
++// file.c
++struct file*    filealloc(void);
++void            fileclose(struct file*);
++struct file*    filedup(struct file*);
++void            fileinit(void);
++int             fileread(struct file*, char*, int n);
++int             filestat(struct file*, struct stat*);
++int             filewrite(struct file*, char*, int n);
++
++// fs.c
++void            readsb(int dev, struct superblock *sb);
++int             dirlink(struct inode*, char*, uint);
++struct inode*   dirlookup(struct inode*, char*, uint*);
++struct inode*   ialloc(uint, short);
++struct inode*   idup(struct inode*);
++void            iinit(int dev);
++void            ilock(struct inode*);
++void            iput(struct inode*);
++void            iunlock(struct inode*);
++void            iunlockput(struct inode*);
++void            iupdate(struct inode*);
++int             namecmp(const char*, const char*);
++struct inode*   namei(char*);
++struct inode*   nameiparent(char*, char*);
++int             readi(struct inode*, char*, uint, uint);
++void            stati(struct inode*, struct stat*);
++int             writei(struct inode*, char*, uint, uint);
++
++// ide.c
++void            ideinit(void);
++void            ideintr(void);
++void            iderw(struct buf*);
++
++// ioapic.c
++void            ioapicenable(int irq, int cpu);
++extern uchar    ioapicid;
++void            ioapicinit(void);
++
++// kalloc.c
++char*           kalloc(void);
++void            kfree(char*);
++void            kinit1(void*, void*);
++void            kinit2(void*, void*);
++
++// kbd.c
++void            kbdintr(void);
++
++// lapic.c
++void            cmostime(struct rtcdate *r);
++int             lapicid(void);
++extern volatile uint*    lapic;
++void            lapiceoi(void);
++void            lapicinit(void);
++void            lapicstartap(uchar, uint);
++void            microdelay(int);
++
++// log.c
++void            initlog(int dev);
++void            log_write(struct buf*);
++void            begin_op();
++void            end_op();
++
++// mp.c
++extern int      ismp;
++void            mpinit(void);
++
++// picirq.c
++void            picenable(int);
++void            picinit(void);
++
++// pipe.c
++int             pipealloc(struct file**, struct file**);
++void            pipeclose(struct pipe*, int);
++int             piperead(struct pipe*, char*, int);
++int             pipewrite(struct pipe*, char*, int);
++
++//PAGEBREAK: 16
++// proc.c
++int             cpuid(void);
++void            exit(void);
++int             fork(void);
++int             growproc(int);
++int             kill(int);
++struct cpu*     mycpu(void);
++struct proc*    myproc();
++void            pinit(void);
++void            procdump(void);
++void            scheduler(void) __attribute__((noreturn));
++void            sched(void);
++void            setproc(struct proc*);
++void            sleep(void*, struct spinlock*);
++void            userinit(void);
++int             wait(void);
++void            wakeup(void*);
++void            yield(void);
++
++int wait2(int*, int*, int*);
++// swtch.S
++void            swtch(struct context**, struct context*);
++
++// spinlock.c
++void            acquire(struct spinlock*);
++void            getcallerpcs(void*, uint*);
++int             holding(struct spinlock*);
++void            initlock(struct spinlock*, char*);
++void            release(struct spinlock*);
++void            pushcli(void);
++void            popcli(void);
++
++// sleeplock.c
++void            acquiresleep(struct sleeplock*);
++void            releasesleep(struct sleeplock*);
++int             holdingsleep(struct sleeplock*);
++void            initsleeplock(struct sleeplock*, char*);
++
++// string.c
++int             memcmp(const void*, const void*, uint);
++void*           memmove(void*, const void*, uint);
++void*           memset(void*, int, uint);
++char*           safestrcpy(char*, const char*, int);
++int             strlen(const char*);
++int             strncmp(const char*, const char*, uint);
++char*           strncpy(char*, const char*, int);
++
++// syscall.c
++int             argint(int, int*);
++int             argptr(int, char**, int);
++int             argstr(int, char**);
++int             fetchint(uint, int*);
++int             fetchstr(uint, char**);
++void            syscall(void);
++
++// timer.c
++void            timerinit(void);
++
++// trap.c
++void            idtinit(void);
++extern uint     ticks;
++void            tvinit(void);
++extern struct spinlock tickslock;
++
++// uart.c
++void            uartinit(void);
++void            uartintr(void);
++void            uartputc(int);
++
++// vm.c
++void            seginit(void);
++void            kvmalloc(void);
++pde_t*          setupkvm(void);
++char*           uva2ka(pde_t*, char*);
++int             allocuvm(pde_t*, uint, uint);
++int             deallocuvm(pde_t*, uint, uint);
++void            freevm(pde_t*);
++void            inituvm(pde_t*, char*, uint);
++int             loaduvm(pde_t*, char*, struct inode*, uint, uint);
++pde_t*          copyuvm(pde_t*, uint);
++void            switchuvm(struct proc*);
++void            switchkvm(void);
++int             copyout(pde_t*, uint, void*, uint);
++void            clearpteu(pde_t *pgdir, char *uva);
++
++// number of elements in fixed-size array
++#define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+diff -ruN xv6-public/.dir-locals.el xv6-final/.dir-locals.el
+--- xv6-public/.dir-locals.el	2021-09-28 19:25:28.146489000 +0530
++++ xv6-final/.dir-locals.el	1970-01-01 05:30:00.000000000 +0530
+@@ -1,4 +0,0 @@
+-((c-mode
+-  (indent-tabs-mode . nil)
+-  (c-file-style . "bsd")
+-  (c-basic-offset . 2)))
+diff -ruN xv6-public/exec.c xv6-final/exec.c
+--- xv6-public/exec.c	2021-09-28 19:25:28.154489000 +0530
++++ xv6-final/exec.c	2021-09-30 21:53:52.460976000 +0530
+@@ -99,6 +99,9 @@
+   curproc->sz = sz;
+   curproc->tf->eip = elf.entry;  // main
+   curproc->tf->esp = sp;
++  #ifdef DML
++  curproc->priority = 2;
++  #endif
+   switchuvm(curproc);
+   freevm(oldpgdir);
+   return 0;
+diff -ruN xv6-public/.gdbinit.tmpl xv6-final/.gdbinit.tmpl
+--- xv6-public/.gdbinit.tmpl	2021-09-28 19:25:28.146489000 +0530
++++ xv6-final/.gdbinit.tmpl	1970-01-01 05:30:00.000000000 +0530
+@@ -1,27 +0,0 @@
+-set $lastcs = -1
+-
+-define hook-stop
+-  # There doesn't seem to be a good way to detect if we're in 16- or
+-  # 32-bit mode, but in 32-bit mode we always run with CS == 8 in the
+-  # kernel and CS == 35 in user space
+-  if $cs == 8 || $cs == 35
+-    if $lastcs != 8 && $lastcs != 35
+-      set architecture i386
+-    end
+-    x/i $pc
+-  else
+-    if $lastcs == -1 || $lastcs == 8 || $lastcs == 35
+-      set architecture i8086
+-    end
+-    # Translate the segment:offset into a physical address
+-    printf "[%4x:%4x] ", $cs, $eip
+-    x/i $cs*16+$eip
+-  end
+-  set $lastcs = $cs
+-end
+-
+-echo + target remote localhost:1234\n
+-target remote localhost:1234
+-
+-echo + symbol-file kernel\n
+-symbol-file kernel
+diff -ruN xv6-public/getpid.c xv6-final/getpid.c
+--- xv6-public/getpid.c	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/getpid.c	2021-09-30 16:57:07.552541000 +0530
+@@ -0,0 +1,8 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++int main(void){
++    printf("Process PID = 1");
++    return 0;
++}
+diff -ruN xv6-public/.git/config xv6-final/.git/config
+--- xv6-public/.git/config	2021-09-28 19:25:28.146489000 +0530
++++ xv6-final/.git/config	2021-09-30 16:57:07.544541000 +0530
+@@ -4,8 +4,8 @@
+ 	bare = false
+ 	logallrefupdates = true
+ [remote "origin"]
+-	url = git://github.com/mit-pdos/xv6-public.git
++	url = https://github.com/Anu8690/xv6-final.git
+ 	fetch = +refs/heads/*:refs/remotes/origin/*
+-[branch "master"]
++[branch "main"]
+ 	remote = origin
+-	merge = refs/heads/master
++	merge = refs/heads/main
+diff -ruN xv6-public/.git/HEAD xv6-final/.git/HEAD
+--- xv6-public/.git/HEAD	2021-09-28 19:25:28.142489000 +0530
++++ xv6-final/.git/HEAD	2021-09-30 16:57:07.540541000 +0530
+@@ -1 +1 @@
+-ref: refs/heads/master
++ref: refs/heads/main
+Binary files xv6-public/.git/index and xv6-final/.git/index differ
+diff -ruN xv6-public/.git/logs/HEAD xv6-final/.git/logs/HEAD
+--- xv6-public/.git/logs/HEAD	2021-09-28 19:25:28.146489000 +0530
++++ xv6-final/.git/logs/HEAD	2021-09-30 16:57:07.544541000 +0530
+@@ -1 +1 @@
+-0000000000000000000000000000000000000000 eeb7b415dbcb12cc362d0783e41c3d1f44066b17 Pallav <pallav@pallav-virtual-machine.(none)> 1632837328 +0530	clone: from git://github.com/mit-pdos/xv6-public.git
++0000000000000000000000000000000000000000 2feee655ce729943a639833f7ed52ca2fd7fc30e Pallav <pallav@pallav-virtual-machine.(none)> 1633001227 +0530	clone: from https://github.com/Anu8690/xv6-final.git
+diff -ruN xv6-public/.git/logs/refs/heads/main xv6-final/.git/logs/refs/heads/main
+--- xv6-public/.git/logs/refs/heads/main	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/.git/logs/refs/heads/main	2021-09-30 16:57:07.544541000 +0530
+@@ -0,0 +1 @@
++0000000000000000000000000000000000000000 2feee655ce729943a639833f7ed52ca2fd7fc30e Pallav <pallav@pallav-virtual-machine.(none)> 1633001227 +0530	clone: from https://github.com/Anu8690/xv6-final.git
+diff -ruN xv6-public/.git/logs/refs/heads/master xv6-final/.git/logs/refs/heads/master
+--- xv6-public/.git/logs/refs/heads/master	2021-09-28 19:25:28.146489000 +0530
++++ xv6-final/.git/logs/refs/heads/master	1970-01-01 05:30:00.000000000 +0530
+@@ -1 +0,0 @@
+-0000000000000000000000000000000000000000 eeb7b415dbcb12cc362d0783e41c3d1f44066b17 Pallav <pallav@pallav-virtual-machine.(none)> 1632837328 +0530	clone: from git://github.com/mit-pdos/xv6-public.git
+diff -ruN xv6-public/.git/logs/refs/remotes/origin/HEAD xv6-final/.git/logs/refs/remotes/origin/HEAD
+--- xv6-public/.git/logs/refs/remotes/origin/HEAD	2021-09-28 19:25:28.142489000 +0530
++++ xv6-final/.git/logs/refs/remotes/origin/HEAD	2021-09-30 16:57:07.540541000 +0530
+@@ -1 +1 @@
+-0000000000000000000000000000000000000000 eeb7b415dbcb12cc362d0783e41c3d1f44066b17 Pallav <pallav@pallav-virtual-machine.(none)> 1632837328 +0530	clone: from git://github.com/mit-pdos/xv6-public.git
++0000000000000000000000000000000000000000 2feee655ce729943a639833f7ed52ca2fd7fc30e Pallav <pallav@pallav-virtual-machine.(none)> 1633001227 +0530	clone: from https://github.com/Anu8690/xv6-final.git
+Binary files xv6-public/.git/objects/pack/pack-12ca327ecdd26d679901b04fa869cf247b06c9ef.idx and xv6-final/.git/objects/pack/pack-12ca327ecdd26d679901b04fa869cf247b06c9ef.idx differ
+Binary files xv6-public/.git/objects/pack/pack-12ca327ecdd26d679901b04fa869cf247b06c9ef.pack and xv6-final/.git/objects/pack/pack-12ca327ecdd26d679901b04fa869cf247b06c9ef.pack differ
+Binary files xv6-public/.git/objects/pack/pack-55ddf94ed9767a3d14ecbf67a687208cbf04cc5f.idx and xv6-final/.git/objects/pack/pack-55ddf94ed9767a3d14ecbf67a687208cbf04cc5f.idx differ
+Binary files xv6-public/.git/objects/pack/pack-55ddf94ed9767a3d14ecbf67a687208cbf04cc5f.pack and xv6-final/.git/objects/pack/pack-55ddf94ed9767a3d14ecbf67a687208cbf04cc5f.pack differ
+diff -ruN xv6-public/.git/packed-refs xv6-final/.git/packed-refs
+--- xv6-public/.git/packed-refs	2021-09-28 19:25:28.142489000 +0530
++++ xv6-final/.git/packed-refs	2021-09-30 16:57:07.540541000 +0530
+@@ -1,28 +1,2 @@
+ # pack-refs with: peeled fully-peeled sorted 
+-eeb7b415dbcb12cc362d0783e41c3d1f44066b17 refs/remotes/origin/master
+-af0e851a3a8a7d13bc2f2d596b58500594040892 refs/tags/osdi12-submit
+-^8286b58087750e09bac3815219e0382a0bb2b159
+-9e698c587b135db17b38a5838976805b9c01e338 refs/tags/symlinks
+-05e0b1218dcebe1f40028531b51926df8ae52be0 refs/tags/xv6-2006
+-^5cc0bd5ceaf805ab44f851e6a3f1952a29e9d7b7
+-42f3c3f7be9717b66ba6e133a113c0f751c53133 refs/tags/xv6-2007
+-adcd16c3f7588b4a28d37495f05e94278c9e3a1e refs/tags/xv6-2008
+-124fe7e457c0dc9b671c7ffccb56004eb61da4f0 refs/tags/xv6-2010
+-5922cdbbcc4fdbd76eec9e0dad9f650e4c86ee99 refs/tags/xv6-rev0
+-^5cc0bd5ceaf805ab44f851e6a3f1952a29e9d7b7
+-81f31a773dd49b001437eaed3975438585ff9911 refs/tags/xv6-rev1
+-^42f3c3f7be9717b66ba6e133a113c0f751c53133
+-b818915f793cd20c5d1e24f668534a9d690f3cc8 refs/tags/xv6-rev11
+-30dab73b68b816877dc8f78504ceca0808c976eb refs/tags/xv6-rev3
+-^074ac7ccd43c08d01a237ce6f14cac10715a51ef
+-113005d48f09a4e3939940d72a77bf6973ea8755 refs/tags/xv6-rev4
+-^124fe7e457c0dc9b671c7ffccb56004eb61da4f0
+-d6aa754494b37e32862b1f78d53deedc53f66a15 refs/tags/xv6-rev5
+-^ae603ff5e79bb7b5eea4147425752f33d29fe558
+-3e9d6413d331b4c912d55bfac253af1629d4bac9 refs/tags/xv6-rev6
+-^e64c661ae8b91bd7e858bb1895bef96e6ac2b4bb
+-ccc25c0fac59067d88af52ad9f3b8cee97c3810a refs/tags/xv6-rev7
+-^2ae8392a5c203a7b1bc5b8bff5eabc8b5eab8972
+-7d6f95e327f1c18570d5dd187e3d92e1aadae2cf refs/tags/xv6-rev8
+-^9ba21267e796eb462a657392906e3cbccaedcc99
+-5bf3fbee00fb27cb8cb4eca72dcd9fc4c288ed71 refs/tags/xv6-rev9
++2feee655ce729943a639833f7ed52ca2fd7fc30e refs/remotes/origin/main
+diff -ruN xv6-public/.git/refs/heads/main xv6-final/.git/refs/heads/main
+--- xv6-public/.git/refs/heads/main	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/.git/refs/heads/main	2021-09-30 16:57:07.544541000 +0530
+@@ -0,0 +1 @@
++2feee655ce729943a639833f7ed52ca2fd7fc30e
+diff -ruN xv6-public/.git/refs/heads/master xv6-final/.git/refs/heads/master
+--- xv6-public/.git/refs/heads/master	2021-09-28 19:25:28.146489000 +0530
++++ xv6-final/.git/refs/heads/master	1970-01-01 05:30:00.000000000 +0530
+@@ -1 +0,0 @@
+-eeb7b415dbcb12cc362d0783e41c3d1f44066b17
+diff -ruN xv6-public/.git/refs/remotes/origin/HEAD xv6-final/.git/refs/remotes/origin/HEAD
+--- xv6-public/.git/refs/remotes/origin/HEAD	2021-09-28 19:25:28.142489000 +0530
++++ xv6-final/.git/refs/remotes/origin/HEAD	2021-09-30 16:57:07.540541000 +0530
+@@ -1 +1 @@
+-ref: refs/remotes/origin/master
++ref: refs/remotes/origin/main
+diff -ruN xv6-public/.gitignore xv6-final/.gitignore
+--- xv6-public/.gitignore	2021-09-28 19:25:28.146489000 +0530
++++ xv6-final/.gitignore	1970-01-01 05:30:00.000000000 +0530
+@@ -1,16 +0,0 @@
+-*~
+-_*
+-*.o
+-*.d
+-*.asm
+-*.sym
+-*.img
+-vectors.S
+-bootblock
+-entryother
+-initcode
+-initcode.out
+-kernel
+-kernelmemfs
+-mkfs
+-.gdbinit
+diff -ruN xv6-public/Makefile xv6-final/Makefile
+--- xv6-public/Makefile	2021-09-28 19:25:28.150489000 +0530
++++ xv6-final/Makefile	2021-09-30 21:59:04.364920000 +0530
+@@ -71,12 +71,17 @@
+ 	echo "***" 1>&2; exit 1)
+ endif
+ 
++ifndef SCHEDFLAG
++SCHEDFLAG := DEFAULT
++endif
++
+ CC = $(TOOLPREFIX)gcc
+ AS = $(TOOLPREFIX)gas
+ LD = $(TOOLPREFIX)ld
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+ CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
++CFLAGS += -D $(SCHEDFLAG)
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+@@ -181,6 +186,8 @@
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_sanity\
++	_SMLsanity\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+@@ -248,7 +255,7 @@
+ # check in that version.
+ 
+ EXTRA=\
+-	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c\
++	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c sanity.c SMLsanity.c\
+ 	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c\
+ 	printf.c umalloc.c\
+ 	README dot-bochsrc *.pl toc.* runoff runoff1 runoff.list\
+diff -ruN xv6-public/Makefile.orig xv6-final/Makefile.orig
+--- xv6-public/Makefile.orig	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/Makefile.orig	2021-09-30 16:57:07.548541000 +0530
+@@ -0,0 +1,291 @@
++OBJS = \
++	bio.o\
++	console.o\
++	exec.o\
++	file.o\
++	fs.o\
++	ide.o\
++	ioapic.o\
++	kalloc.o\
++	kbd.o\
++	lapic.o\
++	log.o\
++	main.o\
++	mp.o\
++	picirq.o\
++	pipe.o\
++	proc.o\
++	sleeplock.o\
++	spinlock.o\
++	string.o\
++	swtch.o\
++	syscall.o\
++	sysfile.o\
++	sysproc.o\
++	trapasm.o\
++	trap.o\
++	uart.o\
++	vectors.o\
++	vm.o\
++
++# Cross-compiling (e.g., on Mac OS X)
++# TOOLPREFIX = i386-jos-elf
++
++# Using native tools (e.g., on X86 Linux)
++#TOOLPREFIX = 
++
++# Try to infer the correct TOOLPREFIX if not set
++ifndef TOOLPREFIX
++TOOLPREFIX := $(shell if i386-jos-elf-objdump -i 2>&1 | grep '^elf32-i386$$' >/dev/null 2>&1; \
++	then echo 'i386-jos-elf-'; \
++	elif objdump -i 2>&1 | grep 'elf32-i386' >/dev/null 2>&1; \
++	then echo ''; \
++	else echo "***" 1>&2; \
++	echo "*** Error: Couldn't find an i386-*-elf version of GCC/binutils." 1>&2; \
++	echo "*** Is the directory with i386-jos-elf-gcc in your PATH?" 1>&2; \
++	echo "*** If your i386-*-elf toolchain is installed with a command" 1>&2; \
++	echo "*** prefix other than 'i386-jos-elf-', set your TOOLPREFIX" 1>&2; \
++	echo "*** environment variable to that prefix and run 'make' again." 1>&2; \
++	echo "*** To turn off this error, run 'gmake TOOLPREFIX= ...'." 1>&2; \
++	echo "***" 1>&2; exit 1; fi)
++endif
++
++# If the makefile can't find QEMU, specify its path here
++# QEMU = qemu-system-i386
++
++# Try to infer the correct QEMU
++ifndef QEMU
++QEMU = $(shell if which qemu > /dev/null; \
++	then echo qemu; exit; \
++	elif which qemu-system-i386 > /dev/null; \
++	then echo qemu-system-i386; exit; \
++	elif which qemu-system-x86_64 > /dev/null; \
++	then echo qemu-system-x86_64; exit; \
++	else \
++	qemu=/Applications/Q.app/Contents/MacOS/i386-softmmu.app/Contents/MacOS/i386-softmmu; \
++	if test -x $$qemu; then echo $$qemu; exit; fi; fi; \
++	echo "***" 1>&2; \
++	echo "*** Error: Couldn't find a working QEMU executable." 1>&2; \
++	echo "*** Is the directory containing the qemu binary in your PATH" 1>&2; \
++	echo "*** or have you tried setting the QEMU variable in Makefile?" 1>&2; \
++	echo "***" 1>&2; exit 1)
++endif
++
++# ifndef SCHEDFLAG
++# SCHEDFLAG := DEFAULT
++# endif
++
++CC = $(TOOLPREFIX)gcc
++AS = $(TOOLPREFIX)gas
++LD = $(TOOLPREFIX)ld
++OBJCOPY = $(TOOLPREFIX)objcopy
++OBJDUMP = $(TOOLPREFIX)objdump
++CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
++# CFLAGS += -D $(SCHEDFLAG)
++CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
++ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
++# FreeBSD ld wants ``elf_i386_fbsd''
++LDFLAGS += -m $(shell $(LD) -V | grep elf_i386 2>/dev/null | head -n 1)
++
++# Disable PIE when possible (for Ubuntu 16.10 toolchain)
++ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]no-pie'),)
++CFLAGS += -fno-pie -no-pie
++endif
++ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]nopie'),)
++CFLAGS += -fno-pie -nopie
++endif
++
++xv6.img: bootblock kernel
++	dd if=/dev/zero of=xv6.img count=10000
++	dd if=bootblock of=xv6.img conv=notrunc
++	dd if=kernel of=xv6.img seek=1 conv=notrunc
++
++xv6memfs.img: bootblock kernelmemfs
++	dd if=/dev/zero of=xv6memfs.img count=10000
++	dd if=bootblock of=xv6memfs.img conv=notrunc
++	dd if=kernelmemfs of=xv6memfs.img seek=1 conv=notrunc
++
++bootblock: bootasm.S bootmain.c
++	$(CC) $(CFLAGS) -fno-pic -O -nostdinc -I. -c bootmain.c
++	$(CC) $(CFLAGS) -fno-pic -nostdinc -I. -c bootasm.S
++	$(LD) $(LDFLAGS) -N -e start -Ttext 0x7C00 -o bootblock.o bootasm.o bootmain.o
++	$(OBJDUMP) -S bootblock.o > bootblock.asm
++	$(OBJCOPY) -S -O binary -j .text bootblock.o bootblock
++	./sign.pl bootblock
++
++entryother: entryother.S
++	$(CC) $(CFLAGS) -fno-pic -nostdinc -I. -c entryother.S
++	$(LD) $(LDFLAGS) -N -e start -Ttext 0x7000 -o bootblockother.o entryother.o
++	$(OBJCOPY) -S -O binary -j .text bootblockother.o entryother
++	$(OBJDUMP) -S bootblockother.o > entryother.asm
++
++initcode: initcode.S
++	$(CC) $(CFLAGS) -nostdinc -I. -c initcode.S
++	$(LD) $(LDFLAGS) -N -e start -Ttext 0 -o initcode.out initcode.o
++	$(OBJCOPY) -S -O binary initcode.out initcode
++	$(OBJDUMP) -S initcode.o > initcode.asm
++
++kernel: $(OBJS) entry.o entryother initcode kernel.ld
++	$(LD) $(LDFLAGS) -T kernel.ld -o kernel entry.o $(OBJS) -b binary initcode entryother
++	$(OBJDUMP) -S kernel > kernel.asm
++	$(OBJDUMP) -t kernel | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > kernel.sym
++
++# kernelmemfs is a copy of kernel that maintains the
++# disk image in memory instead of writing to a disk.
++# This is not so useful for testing persistent storage or
++# exploring disk buffering implementations, but it is
++# great for testing the kernel on real hardware without
++# needing a scratch disk.
++MEMFSOBJS = $(filter-out ide.o,$(OBJS)) memide.o
++kernelmemfs: $(MEMFSOBJS) entry.o entryother initcode kernel.ld fs.img
++	$(LD) $(LDFLAGS) -T kernel.ld -o kernelmemfs entry.o  $(MEMFSOBJS) -b binary initcode entryother fs.img
++	$(OBJDUMP) -S kernelmemfs > kernelmemfs.asm
++	$(OBJDUMP) -t kernelmemfs | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > kernelmemfs.sym
++
++tags: $(OBJS) entryother.S _init
++	etags *.S *.c
++
++vectors.S: vectors.pl
++	./vectors.pl > vectors.S
++
++ULIB = ulib.o usys.o printf.o umalloc.o
++
++_%: %.o $(ULIB)
++	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $@ $^
++	$(OBJDUMP) -S $@ > $*.asm
++	$(OBJDUMP) -t $@ | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $*.sym
++
++_forktest: forktest.o $(ULIB)
++	# forktest has less library code linked in - needs to be small
++	# in order to be able to max out the proc table.
++	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o _forktest forktest.o ulib.o usys.o
++	$(OBJDUMP) -S _forktest > forktest.asm
++
++mkfs: mkfs.c fs.h
++	gcc -Werror -Wall -o mkfs mkfs.c
++
++# Prevent deletion of intermediate files, e.g. cat.o, after first build, so
++# that disk image changes after first build are persistent until clean.  More
++# details:
++# http://www.gnu.org/software/make/manual/html_node/Chained-Rules.html
++.PRECIOUS: %.o
++
++UPROGS=\
++	_cat\
++	_echo\
++	_forktest\
++	_grep\
++	_init\
++	_kill\
++	_ln\
++	_ls\
++	_mkdir\
++	_rm\
++	_sh\
++	_stressfs\
++	_usertests\
++	_wc\
++	_zombie\
++
++fs.img: mkfs README $(UPROGS)
++	./mkfs fs.img README $(UPROGS)
++
++-include *.d
++
++clean: 
++	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
++	*.o *.d *.asm *.sym vectors.S bootblock entryother \
++	initcode initcode.out kernel xv6.img fs.img kernelmemfs \
++	xv6memfs.img mkfs .gdbinit \
++	$(UPROGS)
++
++# make a printout
++FILES = $(shell grep -v '^\#' runoff.list)
++PRINT = runoff.list runoff.spec README toc.hdr toc.ftr $(FILES)
++
++xv6.pdf: $(PRINT)
++	./runoff
++	ls -l xv6.pdf
++
++print: xv6.pdf
++
++# run in emulators
++
++bochs : fs.img xv6.img
++	if [ ! -e .bochsrc ]; then ln -s dot-bochsrc .bochsrc; fi
++	bochs -q
++
++# try to generate a unique GDB port
++GDBPORT = $(shell expr `id -u` % 5000 + 25000)
++# QEMU's gdb stub command line changed in 0.11
++QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
++	then echo "-gdb tcp::$(GDBPORT)"; \
++	else echo "-s -p $(GDBPORT)"; fi)
++ifndef CPUS
++CPUS := 2
++endif
++QEMUOPTS = -drive file=fs.img,index=1,media=disk,format=raw -drive file=xv6.img,index=0,media=disk,format=raw -smp $(CPUS) -m 512 $(QEMUEXTRA)
++
++qemu: fs.img xv6.img
++	$(QEMU) -serial mon:stdio $(QEMUOPTS)
++
++qemu-memfs: xv6memfs.img
++	$(QEMU) -drive file=xv6memfs.img,index=0,media=disk,format=raw -smp $(CPUS) -m 256
++
++qemu-nox: fs.img xv6.img
++	$(QEMU) -nographic $(QEMUOPTS)
++
++.gdbinit: .gdbinit.tmpl
++	sed "s/localhost:1234/localhost:$(GDBPORT)/" < $^ > $@
++
++qemu-gdb: fs.img xv6.img .gdbinit
++	@echo "*** Now run 'gdb'." 1>&2
++	$(QEMU) -serial mon:stdio $(QEMUOPTS) -S $(QEMUGDB)
++
++qemu-nox-gdb: fs.img xv6.img .gdbinit
++	@echo "*** Now run 'gdb'." 1>&2
++	$(QEMU) -nographic $(QEMUOPTS) -S $(QEMUGDB)
++
++# CUT HERE
++# prepare dist for students
++# after running make dist, probably want to
++# rename it to rev0 or rev1 or so on and then
++# check in that version.
++
++EXTRA=\
++	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c\
++	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c\
++	printf.c umalloc.c\
++	README dot-bochsrc *.pl toc.* runoff runoff1 runoff.list\
++	.gdbinit.tmpl gdbutil\
++
++dist:
++	rm -rf dist
++	mkdir dist
++	for i in $(FILES); \
++	do \
++		grep -v PAGEBREAK $$i >dist/$$i; \
++	done
++	sed '/CUT HERE/,$$d' Makefile >dist/Makefile
++	echo >dist/runoff.spec
++	cp $(EXTRA) dist
++
++dist-test:
++	rm -rf dist
++	make dist
++	rm -rf dist-test
++	mkdir dist-test
++	cp dist/* dist-test
++	cd dist-test; $(MAKE) print
++	cd dist-test; $(MAKE) bochs || true
++	cd dist-test; $(MAKE) qemu
++
++# update this rule (change rev#) when it is time to
++# make a new revision.
++tar:
++	rm -rf /tmp/xv6
++	mkdir -p /tmp/xv6
++	cp dist/* dist/.gdbinit.tmpl /tmp/xv6
++	(cd /tmp; tar cf - xv6) | gzip >xv6-rev10.tar.gz  # the next one will be 10 (9/17)
++
++.PHONY: dist-test dist
+diff -ruN xv6-public/param.h xv6-final/param.h
+--- xv6-public/param.h	2021-09-28 19:25:28.158489000 +0530
++++ xv6-final/param.h	2021-09-30 16:57:07.552541000 +0530
+@@ -11,4 +11,4 @@
+ #define LOGSIZE      (MAXOPBLOCKS*3)  // max data blocks in on-disk log
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+ #define FSSIZE       1000  // size of file system in blocks
+-
++#define QUANTA 		 5
+diff -ruN xv6-public/proc.c xv6-final/proc.c
+--- xv6-public/proc.c	2021-09-28 19:25:28.158489000 +0530
++++ xv6-final/proc.c	2021-09-30 22:41:59.890271000 +0530
+@@ -6,7 +6,7 @@
+ #include "x86.h"
+ #include "proc.h"
+ #include "spinlock.h"
+-
++#define NULL 0
+ struct {
+   struct spinlock lock;
+   struct proc proc[NPROC];
+@@ -88,7 +88,12 @@
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
+-
++  p->ctime = ticks;
++  p->priority = 2;
++  int i;
++  for(i = 0; i < 8; ++i) {
++    p->fake[i] = '*';
++  }
+   release(&ptable.lock);
+ 
+   // Allocate kernel stack.
+@@ -202,7 +207,7 @@
+ 
+   // Clear %eax so that fork returns 0 in the child.
+   np->tf->eax = 0;
+-
++  np->priority = curproc->priority;
+   for(i = 0; i < NOFILE; i++)
+     if(curproc->ofile[i])
+       np->ofile[i] = filedup(curproc->ofile[i]);
+@@ -311,6 +316,129 @@
+   }
+ }
+ 
++int wait2(int *retime, int *rutime, int *stime) {
++  // struct proc *p;
++  // int havekids, pid;
++  // acquire(&ptable.lock);
++  // for(;;){
++  //   // Scan through table looking for zombie children.
++  //   havekids = 0;
++  //   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++  //     if(p->parent != myproc())
++  //       continue;
++  //     havekids = 1;
++  //     if(p->state == ZOMBIE){
++  //       // Found one.
++  //       pid = p->pid;
++  //       kfree(p->kstack);
++  //       p->kstack = 0;
++  //       freevm(p->pgdir);
++  //       p->state = UNUSED;
++  //       p->pid = 0;
++  //       p->parent = 0;
++  //       p->name[0] = 0;
++  //       p->killed = 0;
++  //       p->priority = 0;
++  //       p->ctime = 0;
++  //       release(&ptable.lock);
++  //       return pid;
++  //     }
++  //   }
++
++  //   // No point waiting if we don't have any children.
++  //   if(!havekids || proc->killed){
++  //     release(&ptable.lock);
++  //     return -1;
++  //   }
++
++  //   // Wait for children to exit.  (See wakeup1 call in proc_exit.)
++  //   sleep(proc, &ptable.lock);  //DOC: wait-sleep
++  // }
++  return 0;
++}
++
++
++
++#ifdef SML
++struct proc* findreadyprocess(int *index1, int *index2, int *index3, uint *priority) {
++  int i;
++  struct proc* proc2;
++notfound:
++  for (i = 0; i < NPROC; i++) {
++    switch(*priority) {
++      case 1:
++        proc2 = &ptable.proc[(*index1 + i) % NPROC];
++        if (proc2->state == RUNNABLE && proc2->priority == *priority) {
++          *index1 = (*index1 + 1 + i) % NPROC;
++          return proc2; // found a runnable process with appropriate priority
++        }
++      case 2:
++        proc2 = &ptable.proc[(*index2 + i) % NPROC];
++        if (proc2->state == RUNNABLE && proc2->priority == *priority) {
++          *index2 = (*index2 + 1 + i) % NPROC;
++          return proc2; // found a runnable process with appropriate priority
++        }
++      case 3:
++        proc2 = &ptable.proc[(*index3 + i) % NPROC];
++        if (proc2->state == RUNNABLE && proc2->priority == *priority){
++          *index3 = (*index3 + 1 + i) % NPROC;
++          return proc2; // found a runnable process with appropriate priority
++        }
++    }
++  }
++  if (*priority == 1) {//did not find any process on any of the prorities
++    *priority = 3;
++    return 0;
++  }
++  else {
++    *priority -= 1; //will try to find a process at a lower priority
++    goto notfound;
++  }
++  return 0;
++}
++#endif
++
++#ifdef DML
++/*
++  this method will find the next process to run
++*/
++struct proc* findreadyprocess(int *index1, int *index2, int *index3, uint *priority) {
++int i;
++struct proc* proc2;
++notfound:
++  for (i = 0; i < NPROC; i++) {
++    switch(*priority) {
++      case 1:
++        proc2 = &ptable.proc[(*index1 + i) % NPROC];
++        if (proc2->state == RUNNABLE && proc2->priority == *priority) {
++          *index1 = (*index1 + 1 + i) % NPROC;
++          return proc2; // found a runnable process with appropriate priority
++        }
++      case 2:
++        proc2 = &ptable.proc[(*index2 + i) % NPROC];
++        if (proc2->state == RUNNABLE && proc2->priority == *priority) {
++          *index2 = (*index2 + 1 + i) % NPROC;
++          return proc2; // found a runnable process with appropriate priority
++        }
++      case 3:
++        proc2 = &ptable.proc[(*index3 + i) % NPROC];
++        if (proc2->state == RUNNABLE && proc2->priority == *priority){
++          *index3 = (*index3 + 1 + i) % NPROC;
++          return proc2; // found a runnable process with appropriate priority
++        }
++    }
++  }
++  if (*priority == 1) {//did not find any process on any of the prorities
++    *priority = 3;
++    return 0;
++  }
++  else {
++    *priority -= 1; //will try to find a process at a lower priority
++    goto notfound;
++  }
++  return 0;
++}
++#endif
+ //PAGEBREAK: 42
+ // Per-CPU process scheduler.
+ // Each CPU calls scheduler() after setting itself up.
+@@ -325,6 +453,16 @@
+   struct proc *p;
+   struct cpu *c = mycpu();
+   c->proc = 0;
++  int index1 = 0;
++  int index2 = 0;
++  int index3 = 0;
++  int x = index1;
++  index1 = x;
++  x = index2;
++  index2 = x;
++  x = index3;
++  index3 = x;
++
+   
+   for(;;){
+     // Enable interrupts on this processor.
+@@ -332,6 +470,7 @@
+ 
+     // Loop over process table looking for process to run.
+     acquire(&ptable.lock);
++    #ifdef DEFAULT
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+       if(p->state != RUNNABLE)
+         continue;
+@@ -350,6 +489,63 @@
+       // It should have changed its p->state before coming back.
+       c->proc = 0;
+     }
++    #else
++    #ifdef FCFS
++      struct proc *minP = NULL;
++        for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++          if(p->state == RUNNABLE){
++            if (minP!=NULL){
++              if(p->ctime < minP->ctime)
++                minP = p;
++            }
++            else
++              minP = p;
++          }
++        }
++        if (minP!=NULL){
++          p = minP;//the process with the smallest creation time
++          c->proc = p;
++          switchuvm(p);
++          p->state = RUNNING;
++          swtch(&c->scheduler, myproc()->context);
++          switchkvm();
++          // Process is done running for now.
++          // It should have changed its p->state before coming back.
++          c->proc = 0;
++       }
++    #else
++    #ifdef SML
++    uint priority = 3;
++    p = findreadyprocess(&index1, &index2, &index3, &priority);
++    if (p == 0) {
++      release(&ptable.lock);
++      continue;
++    }
++    c->proc = p;
++    switchuvm(p);
++    p->state = RUNNING;
++    swtch(&c->scheduler, myproc()->context);
++    switchkvm();
++    c->proc = 0;
++    #else
++    #ifdef DML
++    uint priority = 3;
++    p = findreadyprocess(&index1, &index2, &index3, &priority);
++    if (p == 0) {
++      release(&ptable.lock);
++      continue;
++    }
++    c->proc = p;
++    switchuvm(p);
++    p->state = RUNNING;
++    p->tickcounter = 0;
++    swtch(&c->scheduler, myproc()->context);
++    switchkvm();
++    c->proc = 0;
++    #endif
++    #endif
++    #endif
++    #endif
+     release(&ptable.lock);
+ 
+   }
+@@ -460,8 +656,12 @@
+   struct proc *p;
+ 
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+-    if(p->state == SLEEPING && p->chan == chan)
++    if(p->state == SLEEPING && p->chan == chan) {
+       p->state = RUNNABLE;
++      #ifdef DML
++      p->priority = 3; // relevant for DML - process waited for I\O, and now it's ready to run again
++      #endif
++    }
+ }
+ 
+ // Wake up all processes sleeping on chan.
+@@ -532,3 +732,54 @@
+     cprintf("\n");
+   }
+ }
++
++
++int set_prio(int priority) {
++  if (priority < 1 || priority > 3)
++    return 1;
++  acquire(&ptable.lock);
++  myproc()->priority = priority;
++  release(&ptable.lock);
++  return 0;
++}
++
++void updatestatistics() {
++  struct proc *p;
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    switch(p->state) {
++      case SLEEPING:
++        p->stime++;
++        break;
++      case RUNNABLE:
++        p->retime++;
++        break;
++      case RUNNING:
++        p->rutime++;
++        break;
++      default:
++        ;
++    }
++  }
++  release(&ptable.lock);
++}
++
++void resettickscycle(int *counter) {
++  acquire(&ptable.lock);
++  *counter = 0;
++  release(&ptable.lock);
++}
++
++void decpriority(void) {
++  // acquire(&ptable.lock);
++  myproc()->priority = myproc()->priority == 1 ? 1 : myproc()->priority - 1;
++  // release(&ptable.lock);
++}
++
++int inctickcounter() {
++  int res;
++  acquire(&ptable.lock);
++  res = ++myproc()->tickcounter;
++  release(&ptable.lock);
++  return res;
++}
+\ No newline at end of file
+diff -ruN xv6-public/proc.c.orig xv6-final/proc.c.orig
+--- xv6-public/proc.c.orig	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/proc.c.orig	2021-09-30 16:57:07.552541000 +0530
+@@ -0,0 +1,556 @@
++#include "types.h"
++#include "defs.h"
++#include "param.h"
++#include "memlayout.h"
++#include "mmu.h"
++#include "x86.h"
++#include "proc.h"
++#include "spinlock.h"
++
++struct {
++  struct spinlock lock;
++  struct proc proc[NPROC];
++} ptable;
++
++static struct proc *initproc;
++
++int nextpid = 1;
++extern void forkret(void);
++extern void trapret(void);
++
++static void wakeup1(void *chan);
++
++void
++pinit(void)
++{
++  initlock(&ptable.lock, "ptable");
++}
++
++// Must be called with interrupts disabled
++int
++cpuid() {
++  return mycpu()-cpus;
++}
++
++// Must be called with interrupts disabled to avoid the caller being
++// rescheduled between reading lapicid and running through the loop.
++struct cpu*
++mycpu(void)
++{
++  int apicid, i;
++  
++  if(readeflags()&FL_IF)
++    panic("mycpu called with interrupts enabled\n");
++  
++  apicid = lapicid();
++  // APIC IDs are not guaranteed to be contiguous. Maybe we should have
++  // a reverse map, or reserve a register to store &cpus[i].
++  for (i = 0; i < ncpu; ++i) {
++    if (cpus[i].apicid == apicid)
++      return &cpus[i];
++  }
++  panic("unknown apicid\n");
++}
++
++// Disable interrupts so that we are not rescheduled
++// while reading proc from the cpu structure
++struct proc*
++myproc(void) {
++  struct cpu *c;
++  struct proc *p;
++  pushcli();
++  c = mycpu();
++  p = c->proc;
++  popcli();
++  return p;
++}
++
++//PAGEBREAK: 32
++// Look in the process table for an UNUSED proc.
++// If found, change state to EMBRYO and initialize
++// state required to run in the kernel.
++// Otherwise return 0.
++static struct proc*
++allocproc(void)
++{
++  struct proc *p;
++  char *sp;
++
++  acquire(&ptable.lock);
++
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
++    if(p->state == UNUSED)
++      goto found;
++
++  release(&ptable.lock);
++  return 0;
++
++found:
++  p->state = EMBRYO;
++  p->pid = nextpid++;
++  p->ctime = ticks;
++  release(&ptable.lock);
++
++  // Allocate kernel stack.
++  if((p->kstack = kalloc()) == 0){
++    p->state = UNUSED;
++    return 0;
++  }
++  sp = p->kstack + KSTACKSIZE;
++
++  // Leave room for trap frame.
++  sp -= sizeof *p->tf;
++  p->tf = (struct trapframe*)sp;
++
++  // Set up new context to start executing at forkret,
++  // which returns to trapret.
++  sp -= 4;
++  *(uint*)sp = (uint)trapret;
++
++  sp -= sizeof *p->context;
++  p->context = (struct context*)sp;
++  memset(p->context, 0, sizeof *p->context);
++  p->context->eip = (uint)forkret;
++
++  return p;
++}
++
++//PAGEBREAK: 32
++// Set up first user process.
++void
++userinit(void)
++{
++  struct proc *p;
++  extern char _binary_initcode_start[], _binary_initcode_size[];
++
++  p = allocproc();
++  
++  initproc = p;
++  if((p->pgdir = setupkvm()) == 0)
++    panic("userinit: out of memory?");
++  inituvm(p->pgdir, _binary_initcode_start, (int)_binary_initcode_size);
++  p->sz = PGSIZE;
++  memset(p->tf, 0, sizeof(*p->tf));
++  p->tf->cs = (SEG_UCODE << 3) | DPL_USER;
++  p->tf->ds = (SEG_UDATA << 3) | DPL_USER;
++  p->tf->es = p->tf->ds;
++  p->tf->ss = p->tf->ds;
++  p->tf->eflags = FL_IF;
++  p->tf->esp = PGSIZE;
++  p->tf->eip = 0;  // beginning of initcode.S
++
++  safestrcpy(p->name, "initcode", sizeof(p->name));
++  p->cwd = namei("/");
++
++  // this assignment to p->state lets other cores
++  // run this process. the acquire forces the above
++  // writes to be visible, and the lock is also needed
++  // because the assignment might not be atomic.
++  acquire(&ptable.lock);
++
++  p->state = RUNNABLE;
++
++  release(&ptable.lock);
++}
++
++// Grow current process's memory by n bytes.
++// Return 0 on success, -1 on failure.
++int
++growproc(int n)
++{
++  uint sz;
++  struct proc *curproc = myproc();
++
++  sz = curproc->sz;
++  if(n > 0){
++    if((sz = allocuvm(curproc->pgdir, sz, sz + n)) == 0)
++      return -1;
++  } else if(n < 0){
++    if((sz = deallocuvm(curproc->pgdir, sz, sz + n)) == 0)
++      return -1;
++  }
++  curproc->sz = sz;
++  switchuvm(curproc);
++  return 0;
++}
++
++// Create a new process copying p as the parent.
++// Sets up stack to return as if from system call.
++// Caller must set state of returned proc to RUNNABLE.
++int
++fork(void)
++{
++  int i, pid;
++  struct proc *np;
++  struct proc *curproc = myproc();
++
++  // Allocate process.
++  if((np = allocproc()) == 0){
++    return -1;
++  }
++
++  // Copy process state from proc.
++  if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0){
++    kfree(np->kstack);
++    np->kstack = 0;
++    np->state = UNUSED;
++    return -1;
++  }
++  np->sz = curproc->sz;
++  np->parent = curproc;
++  *np->tf = *curproc->tf;
++
++  // Clear %eax so that fork returns 0 in the child.
++  np->tf->eax = 0;
++
++  for(i = 0; i < NOFILE; i++)
++    if(curproc->ofile[i])
++      np->ofile[i] = filedup(curproc->ofile[i]);
++  np->cwd = idup(curproc->cwd);
++
++  safestrcpy(np->name, curproc->name, sizeof(curproc->name));
++
++  pid = np->pid;
++
++  acquire(&ptable.lock);
++
++  np->state = RUNNABLE;
++
++  release(&ptable.lock);
++
++  return pid;
++}
++
++// Exit the current process.  Does not return.
++// An exited process remains in the zombie state
++// until its parent calls wait() to find out it exited.
++void
++exit(void)
++{
++  struct proc *curproc = myproc();
++  struct proc *p;
++  int fd;
++
++  if(curproc == initproc)
++    panic("init exiting");
++
++  // Close all open files.
++  for(fd = 0; fd < NOFILE; fd++){
++    if(curproc->ofile[fd]){
++      fileclose(curproc->ofile[fd]);
++      curproc->ofile[fd] = 0;
++    }
++  }
++
++  begin_op();
++  iput(curproc->cwd);
++  end_op();
++  curproc->cwd = 0;
++
++  acquire(&ptable.lock);
++
++  // Parent might be sleeping in wait().
++  wakeup1(curproc->parent);
++
++  // Pass abandoned children to init.
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    if(p->parent == curproc){
++      p->parent = initproc;
++      if(p->state == ZOMBIE)
++        wakeup1(initproc);
++    }
++  }
++
++  // Jump into the scheduler, never to return.
++  curproc->state = ZOMBIE;
++  sched();
++  panic("zombie exit");
++}
++
++// Wait for a child process to exit and return its pid.
++// Return -1 if this process has no children.
++int
++wait(void)
++{
++  struct proc *p;
++  int havekids, pid;
++  struct proc *curproc = myproc();
++  
++  acquire(&ptable.lock);
++  for(;;){
++    // Scan through table looking for exited children.
++    havekids = 0;
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      if(p->parent != curproc)
++        continue;
++      havekids = 1;
++      if(p->state == ZOMBIE){
++        // Found one.
++        pid = p->pid;
++        kfree(p->kstack);
++        p->kstack = 0;
++        freevm(p->pgdir);
++        p->pid = 0;
++        p->parent = 0;
++        p->name[0] = 0;
++        p->killed = 0;
++        p->state = UNUSED;
++        release(&ptable.lock);
++        return pid;
++      }
++    }
++
++    // No point waiting if we don't have any children.
++    if(!havekids || curproc->killed){
++      release(&ptable.lock);
++      return -1;
++    }
++
++    // Wait for children to exit.  (See wakeup1 call in proc_exit.)
++    sleep(curproc, &ptable.lock);  //DOC: wait-sleep
++  }
++}
++
++//PAGEBREAK: 42
++// Per-CPU process scheduler.
++// Each CPU calls scheduler() after setting itself up.
++// Scheduler never returns.  It loops, doing:
++//  - choose a process to run
++//  - swtch to start running that process
++//  - eventually that process transfers control
++//      via swtch back to the scheduler.
++void
++scheduler(void)
++{
++  struct proc *p;
++  struct cpu *c = mycpu();
++  c->proc = 0;
++  
++  for(;;){
++    // Enable interrupts on this processor.
++    sti();
++
++    // Loop over process table looking for process to run.
++    acquire(&ptable.lock);
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      if(p->state != RUNNABLE)
++        continue;
++
++      // Switch to chosen process.  It is the process's job
++      // to release ptable.lock and then reacquire it
++      // before jumping back to us.
++      c->proc = p;
++      switchuvm(p);
++      p->state = RUNNING;
++
++      swtch(&(c->scheduler), p->context);
++      switchkvm();
++
++      // Process is done running for now.
++      // It should have changed its p->state before coming back.
++      c->proc = 0;
++    }
++    release(&ptable.lock);
++
++  }
++}
++
++// Enter scheduler.  Must hold only ptable.lock
++// and have changed proc->state. Saves and restores
++// intena because intena is a property of this
++// kernel thread, not this CPU. It should
++// be proc->intena and proc->ncli, but that would
++// break in the few places where a lock is held but
++// there's no process.
++void
++sched(void)
++{
++  int intena;
++  struct proc *p = myproc();
++
++  if(!holding(&ptable.lock))
++    panic("sched ptable.lock");
++  if(mycpu()->ncli != 1)
++    panic("sched locks");
++  if(p->state == RUNNING)
++    panic("sched running");
++  if(readeflags()&FL_IF)
++    panic("sched interruptible");
++  intena = mycpu()->intena;
++  swtch(&p->context, mycpu()->scheduler);
++  mycpu()->intena = intena;
++}
++
++// Give up the CPU for one scheduling round.
++void
++yield(void)
++{
++  acquire(&ptable.lock);  //DOC: yieldlock
++  myproc()->state = RUNNABLE;
++  sched();
++  release(&ptable.lock);
++}
++
++// A fork child's very first scheduling by scheduler()
++// will swtch here.  "Return" to user space.
++void
++forkret(void)
++{
++  static int first = 1;
++  // Still holding ptable.lock from scheduler.
++  release(&ptable.lock);
++
++  if (first) {
++    // Some initialization functions must be run in the context
++    // of a regular process (e.g., they call sleep), and thus cannot
++    // be run from main().
++    first = 0;
++    iinit(ROOTDEV);
++    initlog(ROOTDEV);
++  }
++
++  // Return to "caller", actually trapret (see allocproc).
++}
++
++// Atomically release lock and sleep on chan.
++// Reacquires lock when awakened.
++void
++sleep(void *chan, struct spinlock *lk)
++{
++  struct proc *p = myproc();
++  
++  if(p == 0)
++    panic("sleep");
++
++  if(lk == 0)
++    panic("sleep without lk");
++
++  // Must acquire ptable.lock in order to
++  // change p->state and then call sched.
++  // Once we hold ptable.lock, we can be
++  // guaranteed that we won't miss any wakeup
++  // (wakeup runs with ptable.lock locked),
++  // so it's okay to release lk.
++  if(lk != &ptable.lock){  //DOC: sleeplock0
++    acquire(&ptable.lock);  //DOC: sleeplock1
++    release(lk);
++  }
++  // Go to sleep.
++  p->chan = chan;
++  p->state = SLEEPING;
++
++  sched();
++
++  // Tidy up.
++  p->chan = 0;
++
++  // Reacquire original lock.
++  if(lk != &ptable.lock){  //DOC: sleeplock2
++    release(&ptable.lock);
++    acquire(lk);
++  }
++}
++
++//PAGEBREAK!
++// Wake up all processes sleeping on chan.
++// The ptable lock must be held.
++static void
++wakeup1(void *chan)
++{
++  struct proc *p;
++
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
++    if(p->state == SLEEPING && p->chan == chan)
++      p->state = RUNNABLE;
++}
++
++// Wake up all processes sleeping on chan.
++void
++wakeup(void *chan)
++{
++  acquire(&ptable.lock);
++  wakeup1(chan);
++  release(&ptable.lock);
++}
++
++// Kill the process with the given pid.
++// Process won't exit until it returns
++// to user space (see trap in trap.c).
++int
++kill(int pid)
++{
++  struct proc *p;
++
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    if(p->pid == pid){
++      p->killed = 1;
++      // Wake process from sleep if necessary.
++      if(p->state == SLEEPING)
++        p->state = RUNNABLE;
++      release(&ptable.lock);
++      return 0;
++    }
++  }
++  release(&ptable.lock);
++  return -1;
++}
++
++//PAGEBREAK: 36
++// Print a process listing to console.  For debugging.
++// Runs when user types ^P on console.
++// No lock to avoid wedging a stuck machine further.
++void
++procdump(void)
++{
++  static char *states[] = {
++  [UNUSED]    "unused",
++  [EMBRYO]    "embryo",
++  [SLEEPING]  "sleep ",
++  [RUNNABLE]  "runble",
++  [RUNNING]   "run   ",
++  [ZOMBIE]    "zombie"
++  };
++  int i;
++  struct proc *p;
++  char *state;
++  uint pc[10];
++
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    if(p->state == UNUSED)
++      continue;
++    if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
++      state = states[p->state];
++    else
++      state = "???";
++    cprintf("%d %s %s", p->pid, state, p->name);
++    if(p->state == SLEEPING){
++      getcallerpcs((uint*)p->context->ebp+2, pc);
++      for(i=0; i<10 && pc[i] != 0; i++)
++        cprintf(" %p", pc[i]);
++    }
++    cprintf("\n");
++  }
++}
++
++
++void updatestatistics() {
++  struct proc *p;
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    switch(p->state) {
++      case SLEEPING:
++        p->stime++;
++        break;
++      case RUNNABLE:
++        p->retime++;
++        break;
++      case RUNNING:
++        p->rutime++;
++        break;
++      default:
++        ;
++    }
++  }
++  release(&ptable.lock);
++}
+diff -ruN xv6-public/proc.h xv6-final/proc.h
+--- xv6-public/proc.h	2021-09-28 19:25:28.158489000 +0530
++++ xv6-final/proc.h	2021-09-30 21:57:59.529522000 +0530
+@@ -49,8 +49,17 @@
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int tickcounter;
++  char fake[8];
++  uint ctime;
++  int priority;
++  int retime;
++  int rutime;
++  int stime;
+ };
+ 
++void updatestatistics();
++
+ // Process memory is laid out contiguously, low addresses first:
+ //   text
+ //   original data and bss
+diff -ruN xv6-public/proc.h.orig xv6-final/proc.h.orig
+--- xv6-public/proc.h.orig	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/proc.h.orig	2021-09-30 16:57:07.560541000 +0530
+@@ -0,0 +1,65 @@
++// Per-CPU state
++struct cpu {
++  uchar apicid;                // Local APIC ID
++  struct context *scheduler;   // swtch() here to enter scheduler
++  struct taskstate ts;         // Used by x86 to find stack for interrupt
++  struct segdesc gdt[NSEGS];   // x86 global descriptor table
++  volatile uint started;       // Has the CPU started?
++  int ncli;                    // Depth of pushcli nesting.
++  int intena;                  // Were interrupts enabled before pushcli?
++  struct proc *proc;           // The process running on this cpu or null
++};
++
++extern struct cpu cpus[NCPU];
++extern int ncpu;
++
++//PAGEBREAK: 17
++// Saved registers for kernel context switches.
++// Don't need to save all the segment registers (%cs, etc),
++// because they are constant across kernel contexts.
++// Don't need to save %eax, %ecx, %edx, because the
++// x86 convention is that the caller has saved them.
++// Contexts are stored at the bottom of the stack they
++// describe; the stack pointer is the address of the context.
++// The layout of the context matches the layout of the stack in swtch.S
++// at the "Switch stacks" comment. Switch doesn't save eip explicitly,
++// but it is on the stack and allocproc() manipulates it.
++struct context {
++  uint edi;
++  uint esi;
++  uint ebx;
++  uint ebp;
++  uint eip;
++};
++
++enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
++
++// Per-process state
++struct proc {
++  uint sz;                     // Size of process memory (bytes)
++  pde_t* pgdir;                // Page table
++  char *kstack;                // Bottom of kernel stack for this process
++  enum procstate state;        // Process state
++  int pid;                     // Process ID
++  struct proc *parent;         // Parent process
++  struct trapframe *tf;        // Trap frame for current syscall
++  struct context *context;     // swtch() here to run process
++  void *chan;                  // If non-zero, sleeping on chan
++  int killed;                  // If non-zero, have been killed
++  struct file *ofile[NOFILE];  // Open files
++  struct inode *cwd;           // Current directory
++  char name[16];               // Process name (debugging)
++  
++  uint ctime;                   // Process creation time
++  int stime;                   //process SLEEPING time
++  int retime;                  //process READY(RUNNABLE) time
++  int rutime;                  //process RUNNING time
++};
++
++
++void updatestatistics();
++// Process memory is laid out contiguously, low addresses first:
++//   text
++//   original data and bss
++//   fixed-size stack
++//   expandable heap
+diff -ruN xv6-public/sanity.c xv6-final/sanity.c
+--- xv6-public/sanity.c	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/sanity.c	2021-09-30 22:01:23.315221000 +0530
+@@ -0,0 +1,84 @@
++#include "types.h"
++#include "user.h"
++
++int
++main(int argc, char *argv[])
++{
++	if (argc != 2){
++		printf(1, "Usage: sanity <n>\n");
++		exit();
++ 	}
++	int i;
++	int n;
++	int j = 0;
++	int k;
++	int retime;
++	int rutime;
++	int stime;
++	int sums[3][3];
++	for (i = 0; i < 3; i++)
++		for (j = 0; j < 3; j++)
++			sums[i][j] = 0;
++	n = atoi(argv[1]);
++	i = n; //unimportant
++	int pid;
++	for (i = 0; i < 3 * n; i++) {
++		j = i % 3;
++		pid = fork();
++		if (pid == 0) {//child
++			j = (getpid() - 4) % 3; // ensures independence from the first son's pid when gathering the results in the second part of the program
++			switch(j) {
++				case 0: //CPU‐bound process (CPU):
++					for (k = 0; k < 100; k++){
++						for (j = 0; j < 1000000; j++){}
++					}
++					//	yield();   														TODO GILAD
++					break;
++				case 1: //short tasks based CPU‐bound process (S‐CPU):
++					for (k = 0; k < 100; k++){
++						for (j = 0; j < 1000000; j++){}
++						yield();
++					}
++					break;
++				case 2:// simulate I/O bound process (IO)
++					for(k = 0; k < 100; k++){
++						sleep(1);
++					}
++					break;
++			}
++			exit(); // children exit here
++		}
++		continue; // father continues to spawn the next child
++	}
++	for (i = 0; i < 3 * n; i++) {
++		pid = wait2(&retime, &rutime, &stime);
++		int res = (pid - 4) % 3; // correlates to j in the dispatching loop
++		switch(res) {
++			case 0: // CPU bound processes
++				printf(1, "CPU-bound, pid: %d, ready: %d, running: %d, sleeping: %d, turnaround: %d\n", pid, retime, rutime, stime, retime + rutime + stime);
++				sums[0][0] += retime;
++				sums[0][1] += rutime;
++				sums[0][2] += stime;
++				break;
++			case 1: // CPU bound processes, short tasks
++				printf(1, "S-CPU bound, pid: %d, ready: %d, running: %d, sleeping: %d, turnaround: %d\n", pid, retime, rutime, stime, retime + rutime + stime);
++				sums[1][0] += retime;
++				sums[1][1] += rutime;
++				sums[1][2] += stime;
++				break;
++			case 2: // simulating I/O bound processes
++				printf(1, "I/O bound, pid: %d, ready: %d, running: %d, sleeping: %d, turnaround: %d\n", pid, retime, rutime, stime, retime + rutime + stime);
++				sums[2][0] += retime;
++				sums[2][1] += rutime;
++				sums[2][2] += stime;
++				break;
++		}
++	}
++	for (i = 0; i < 3; i++)
++		for (j = 0; j < 3; j++)
++			sums[i][j] /= n;
++	printf(1, "\nCPU bound:\nAverage ready time: %d\nAverage running time: %d\nAverage sleeping time: %d\nAverage turnaround time: %d\n\n", sums[0][0], sums[0][1], sums[0][2], sums[0][0] + sums[0][1] + sums[0][2]);
++	printf(1, "CPU-S bound:\nAverage ready time: %d\nAverage running time: %d\nAverage sleeping time: %d\nAverage turnaround time: %d\n\n", sums[1][0], sums[1][1], sums[1][2], sums[1][0] + sums[1][1] + sums[1][2]);
++	printf(1, "I/O bound:\nAverage ready time: %d\nAverage running time: %d\nAverage sleeping time: %d\nAverage turnaround time: %d\n\n", sums[2][0], sums[2][1], sums[2][2], sums[2][0] + sums[2][1] + sums[2][2]);
++	exit();
++}
+\ No newline at end of file
+diff -ruN xv6-public/sh.c xv6-final/sh.c
+--- xv6-public/sh.c	2021-09-28 19:25:28.158489000 +0530
++++ xv6-final/sh.c	2021-09-30 20:31:42.148394000 +0530
+@@ -3,6 +3,7 @@
+ #include "types.h"
+ #include "user.h"
+ #include "fcntl.h"
++#include "console.h"
+ 
+ // Parsed command representation
+ #define EXEC  1
+@@ -53,6 +54,21 @@
+ void panic(char*);
+ struct cmd *parsecmd(char*);
+ 
++char cmdFromHistory[INPUT_BUF];//this is the buffer that will get the current history command from history
++
++/*
++  this the function the calls to the different history indexes
++*/
++void history1() {
++  int i, count = 0;
++  for (i = 0; i < MAX_HISTORY; i++) {
++    if (history(cmdFromHistory, MAX_HISTORY-i-1) == 0) { //this is the sys call
++      count++;
++      printf(1, " %d: %s\n", count, cmdFromHistory);
++    }
++  }
++}
++
+ // Execute cmd.  Never returns.
+ void
+ runcmd(struct cmd *cmd)
+@@ -144,9 +160,31 @@
+ int
+ main(void)
+ {
+-  static char buf[100];
+-  int fd;
++  // printing the scheduling policy chosen
++  printf(1, "Selected scheduling policy: ");
++  #ifdef DEFAULT
++    printf(1, "default\n");
++  #endif
++  #ifdef FCFS
++    printf(1, "FCFS\n");
++  #endif
++  #ifdef SML
++    printf(1, "SML\n");
++  #endif
++  #ifdef DML
++    printf(1, "DML\n");
++  #endif
++  // #endif
++  // #endif
++  // #endif
++
++  printf(1, "scheduling policy chosen\n");
++
+ 
++
++  static char buf[INPUT_BUF];
++  int fd;
++  // int retime, rutime, stime,pid;
+   // Ensure that three file descriptors are open.
+   while((fd = open("console", O_RDWR)) >= 0){
+     if(fd >= 3){
+@@ -154,7 +192,7 @@
+       break;
+     }
+   }
+-
++  
+   // Read and run input commands.
+   while(getcmd(buf, sizeof(buf)) >= 0){
+     if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
+@@ -164,9 +202,20 @@
+         printf(2, "cannot cd %s\n", buf+3);
+       continue;
+     }
++    if(buf[0] == 'h' && buf[1] == 'i' && buf[2] == 's' && buf[3] == 't' && buf[4] == 'o' && buf[5] == 'r' && buf[6] == 'y' && buf[7] == '\n') {
++      history1();
++      continue;
++    }
++    // if (buf[0] == 'g' && buf[1] == 'e' && buf[2] == 't' && buf[3] == 'p'
++    //     && buf[4] == 'i' && buf[5] == 'd') {
++    //   printf(1, "Process ID: %d\n", getpid());
++    //   continue;
++    // }
+     if(fork1() == 0)
+       runcmd(parsecmd(buf));
+-    wait();
++    else{
++      wait();
++    }
+   }
+   exit();
+ }
+@@ -491,3 +540,4 @@
+   }
+   return cmd;
+ }
++
+diff -ruN xv6-public/sh.c.orig xv6-final/sh.c.orig
+--- xv6-public/sh.c.orig	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/sh.c.orig	2021-09-30 16:57:07.560541000 +0530
+@@ -0,0 +1,522 @@
++// Shell.
++
++#include "types.h"
++#include "user.h"
++#include "fcntl.h"
++#include "console.h"
++
++// Parsed command representation
++#define EXEC  1
++#define REDIR 2
++#define PIPE  3
++#define LIST  4
++#define BACK  5
++
++#define MAXARGS 10
++
++struct cmd {
++  int type;
++};
++
++struct execcmd {
++  int type;
++  char *argv[MAXARGS];
++  char *eargv[MAXARGS];
++};
++
++struct redircmd {
++  int type;
++  struct cmd *cmd;
++  char *file;
++  char *efile;
++  int mode;
++  int fd;
++};
++
++struct pipecmd {
++  int type;
++  struct cmd *left;
++  struct cmd *right;
++};
++
++struct listcmd {
++  int type;
++  struct cmd *left;
++  struct cmd *right;
++};
++
++struct backcmd {
++  int type;
++  struct cmd *cmd;
++};
++
++int fork1(void);  // Fork but panics on failure.
++void panic(char*);
++struct cmd *parsecmd(char*);
++
++char cmdFromHistory[INPUT_BUF];//this is the buffer that will get the current history command from history
++
++/*
++  this the function the calls to the different history indexes
++*/
++void history1() {
++  int i, count = 0;
++  for (i = 0; i < MAX_HISTORY; i++) {
++    if (history(cmdFromHistory, MAX_HISTORY-i-1) == 0) { //this is the sys call
++      count++;
++      printf(1, " %d: %s\n", count, cmdFromHistory);
++    }
++  }
++}
++
++// Execute cmd.  Never returns.
++void
++runcmd(struct cmd *cmd)
++{
++  int p[2];
++  struct backcmd *bcmd;
++  struct execcmd *ecmd;
++  struct listcmd *lcmd;
++  struct pipecmd *pcmd;
++  struct redircmd *rcmd;
++
++  if(cmd == 0)
++    exit();
++
++  switch(cmd->type){
++  default:
++    panic("runcmd");
++
++  case EXEC:
++    ecmd = (struct execcmd*)cmd;
++    if(ecmd->argv[0] == 0)
++      exit();
++    exec(ecmd->argv[0], ecmd->argv);
++    printf(2, "exec %s failed\n", ecmd->argv[0]);
++    break;
++
++  case REDIR:
++    rcmd = (struct redircmd*)cmd;
++    close(rcmd->fd);
++    if(open(rcmd->file, rcmd->mode) < 0){
++      printf(2, "open %s failed\n", rcmd->file);
++      exit();
++    }
++    runcmd(rcmd->cmd);
++    break;
++
++  case LIST:
++    lcmd = (struct listcmd*)cmd;
++    if(fork1() == 0)
++      runcmd(lcmd->left);
++    wait();
++    runcmd(lcmd->right);
++    break;
++
++  case PIPE:
++    pcmd = (struct pipecmd*)cmd;
++    if(pipe(p) < 0)
++      panic("pipe");
++    if(fork1() == 0){
++      close(1);
++      dup(p[1]);
++      close(p[0]);
++      close(p[1]);
++      runcmd(pcmd->left);
++    }
++    if(fork1() == 0){
++      close(0);
++      dup(p[0]);
++      close(p[0]);
++      close(p[1]);
++      runcmd(pcmd->right);
++    }
++    close(p[0]);
++    close(p[1]);
++    wait();
++    wait();
++    break;
++
++  case BACK:
++    bcmd = (struct backcmd*)cmd;
++    if(fork1() == 0)
++      runcmd(bcmd->cmd);
++    break;
++  }
++  exit();
++}
++
++int
++getcmd(char *buf, int nbuf)
++{
++  printf(2, "$ ");
++  memset(buf, 0, nbuf);
++  gets(buf, nbuf);
++  if(buf[0] == 0) // EOF
++    return -1;
++  return 0;
++}
++
++int
++main(void)
++{
++  static char buf[INPUT_BUF];
++  int fd;
++  int retime, rutime, stime,pid;
++  // Ensure that three file descriptors are open.
++  while((fd = open("console", O_RDWR)) >= 0){
++    if(fd >= 3){
++      close(fd);
++      break;
++    }
++  }
++  
++  // Read and run input commands.
++  while(getcmd(buf, sizeof(buf)) >= 0){
++    if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
++      // Chdir must be called by the parent, not the child.
++      buf[strlen(buf)-1] = 0;  // chop \n
++      if(chdir(buf+3) < 0)
++        printf(2, "cannot cd %s\n", buf+3);
++      continue;
++    }
++    if(buf[0] == 'h' && buf[1] == 'i' && buf[2] == 's' && buf[3] == 't' && buf[4] == 'o' && buf[5] == 'r' && buf[6] == 'y' && buf[7] == '\n') {
++      history1();
++      continue;
++    }
++    // if (buf[0] == 'g' && buf[1] == 'e' && buf[2] == 't' && buf[3] == 'p'
++    //     && buf[4] == 'i' && buf[5] == 'd') {
++    //   printf(1, "Process ID: %d\n", getpid());
++    //   continue;
++    // }
++    if(fork1() == 0)
++      runcmd(parsecmd(buf));
++    else {
++  		pid=wait2(&retime, &rutime, &stime);
++  		printf(1, "pid:%d retime:%d rutime:%d stime:%d\n", pid, retime, rutime, stime);
++  	}
++  }
++  exit();
++}
++
++void
++panic(char *s)
++{
++  printf(2, "%s\n", s);
++  exit();
++}
++
++int
++fork1(void)
++{
++  int pid;
++
++  pid = fork();
++  if(pid == -1)
++    panic("fork");
++  return pid;
++}
++
++//PAGEBREAK!
++// Constructors
++
++struct cmd*
++execcmd(void)
++{
++  struct execcmd *cmd;
++
++  cmd = malloc(sizeof(*cmd));
++  memset(cmd, 0, sizeof(*cmd));
++  cmd->type = EXEC;
++  return (struct cmd*)cmd;
++}
++
++struct cmd*
++redircmd(struct cmd *subcmd, char *file, char *efile, int mode, int fd)
++{
++  struct redircmd *cmd;
++
++  cmd = malloc(sizeof(*cmd));
++  memset(cmd, 0, sizeof(*cmd));
++  cmd->type = REDIR;
++  cmd->cmd = subcmd;
++  cmd->file = file;
++  cmd->efile = efile;
++  cmd->mode = mode;
++  cmd->fd = fd;
++  return (struct cmd*)cmd;
++}
++
++struct cmd*
++pipecmd(struct cmd *left, struct cmd *right)
++{
++  struct pipecmd *cmd;
++
++  cmd = malloc(sizeof(*cmd));
++  memset(cmd, 0, sizeof(*cmd));
++  cmd->type = PIPE;
++  cmd->left = left;
++  cmd->right = right;
++  return (struct cmd*)cmd;
++}
++
++struct cmd*
++listcmd(struct cmd *left, struct cmd *right)
++{
++  struct listcmd *cmd;
++
++  cmd = malloc(sizeof(*cmd));
++  memset(cmd, 0, sizeof(*cmd));
++  cmd->type = LIST;
++  cmd->left = left;
++  cmd->right = right;
++  return (struct cmd*)cmd;
++}
++
++struct cmd*
++backcmd(struct cmd *subcmd)
++{
++  struct backcmd *cmd;
++
++  cmd = malloc(sizeof(*cmd));
++  memset(cmd, 0, sizeof(*cmd));
++  cmd->type = BACK;
++  cmd->cmd = subcmd;
++  return (struct cmd*)cmd;
++}
++//PAGEBREAK!
++// Parsing
++
++char whitespace[] = " \t\r\n\v";
++char symbols[] = "<|>&;()";
++
++int
++gettoken(char **ps, char *es, char **q, char **eq)
++{
++  char *s;
++  int ret;
++
++  s = *ps;
++  while(s < es && strchr(whitespace, *s))
++    s++;
++  if(q)
++    *q = s;
++  ret = *s;
++  switch(*s){
++  case 0:
++    break;
++  case '|':
++  case '(':
++  case ')':
++  case ';':
++  case '&':
++  case '<':
++    s++;
++    break;
++  case '>':
++    s++;
++    if(*s == '>'){
++      ret = '+';
++      s++;
++    }
++    break;
++  default:
++    ret = 'a';
++    while(s < es && !strchr(whitespace, *s) && !strchr(symbols, *s))
++      s++;
++    break;
++  }
++  if(eq)
++    *eq = s;
++
++  while(s < es && strchr(whitespace, *s))
++    s++;
++  *ps = s;
++  return ret;
++}
++
++int
++peek(char **ps, char *es, char *toks)
++{
++  char *s;
++
++  s = *ps;
++  while(s < es && strchr(whitespace, *s))
++    s++;
++  *ps = s;
++  return *s && strchr(toks, *s);
++}
++
++struct cmd *parseline(char**, char*);
++struct cmd *parsepipe(char**, char*);
++struct cmd *parseexec(char**, char*);
++struct cmd *nulterminate(struct cmd*);
++
++struct cmd*
++parsecmd(char *s)
++{
++  char *es;
++  struct cmd *cmd;
++
++  es = s + strlen(s);
++  cmd = parseline(&s, es);
++  peek(&s, es, "");
++  if(s != es){
++    printf(2, "leftovers: %s\n", s);
++    panic("syntax");
++  }
++  nulterminate(cmd);
++  return cmd;
++}
++
++struct cmd*
++parseline(char **ps, char *es)
++{
++  struct cmd *cmd;
++
++  cmd = parsepipe(ps, es);
++  while(peek(ps, es, "&")){
++    gettoken(ps, es, 0, 0);
++    cmd = backcmd(cmd);
++  }
++  if(peek(ps, es, ";")){
++    gettoken(ps, es, 0, 0);
++    cmd = listcmd(cmd, parseline(ps, es));
++  }
++  return cmd;
++}
++
++struct cmd*
++parsepipe(char **ps, char *es)
++{
++  struct cmd *cmd;
++
++  cmd = parseexec(ps, es);
++  if(peek(ps, es, "|")){
++    gettoken(ps, es, 0, 0);
++    cmd = pipecmd(cmd, parsepipe(ps, es));
++  }
++  return cmd;
++}
++
++struct cmd*
++parseredirs(struct cmd *cmd, char **ps, char *es)
++{
++  int tok;
++  char *q, *eq;
++
++  while(peek(ps, es, "<>")){
++    tok = gettoken(ps, es, 0, 0);
++    if(gettoken(ps, es, &q, &eq) != 'a')
++      panic("missing file for redirection");
++    switch(tok){
++    case '<':
++      cmd = redircmd(cmd, q, eq, O_RDONLY, 0);
++      break;
++    case '>':
++      cmd = redircmd(cmd, q, eq, O_WRONLY|O_CREATE, 1);
++      break;
++    case '+':  // >>
++      cmd = redircmd(cmd, q, eq, O_WRONLY|O_CREATE, 1);
++      break;
++    }
++  }
++  return cmd;
++}
++
++struct cmd*
++parseblock(char **ps, char *es)
++{
++  struct cmd *cmd;
++
++  if(!peek(ps, es, "("))
++    panic("parseblock");
++  gettoken(ps, es, 0, 0);
++  cmd = parseline(ps, es);
++  if(!peek(ps, es, ")"))
++    panic("syntax - missing )");
++  gettoken(ps, es, 0, 0);
++  cmd = parseredirs(cmd, ps, es);
++  return cmd;
++}
++
++struct cmd*
++parseexec(char **ps, char *es)
++{
++  char *q, *eq;
++  int tok, argc;
++  struct execcmd *cmd;
++  struct cmd *ret;
++
++  if(peek(ps, es, "("))
++    return parseblock(ps, es);
++
++  ret = execcmd();
++  cmd = (struct execcmd*)ret;
++
++  argc = 0;
++  ret = parseredirs(ret, ps, es);
++  while(!peek(ps, es, "|)&;")){
++    if((tok=gettoken(ps, es, &q, &eq)) == 0)
++      break;
++    if(tok != 'a')
++      panic("syntax");
++    cmd->argv[argc] = q;
++    cmd->eargv[argc] = eq;
++    argc++;
++    if(argc >= MAXARGS)
++      panic("too many args");
++    ret = parseredirs(ret, ps, es);
++  }
++  cmd->argv[argc] = 0;
++  cmd->eargv[argc] = 0;
++  return ret;
++}
++
++// NUL-terminate all the counted strings.
++struct cmd*
++nulterminate(struct cmd *cmd)
++{
++  int i;
++  struct backcmd *bcmd;
++  struct execcmd *ecmd;
++  struct listcmd *lcmd;
++  struct pipecmd *pcmd;
++  struct redircmd *rcmd;
++
++  if(cmd == 0)
++    return 0;
++
++  switch(cmd->type){
++  case EXEC:
++    ecmd = (struct execcmd*)cmd;
++    for(i=0; ecmd->argv[i]; i++)
++      *ecmd->eargv[i] = 0;
++    break;
++
++  case REDIR:
++    rcmd = (struct redircmd*)cmd;
++    nulterminate(rcmd->cmd);
++    *rcmd->efile = 0;
++    break;
++
++  case PIPE:
++    pcmd = (struct pipecmd*)cmd;
++    nulterminate(pcmd->left);
++    nulterminate(pcmd->right);
++    break;
++
++  case LIST:
++    lcmd = (struct listcmd*)cmd;
++    nulterminate(lcmd->left);
++    nulterminate(lcmd->right);
++    break;
++
++  case BACK:
++    bcmd = (struct backcmd*)cmd;
++    nulterminate(bcmd->cmd);
++    break;
++  }
++  return cmd;
++}
++
+diff -ruN xv6-public/SMLsanity.c xv6-final/SMLsanity.c
+--- xv6-public/SMLsanity.c	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/SMLsanity.c	2021-09-30 22:53:37.837078000 +0530
+@@ -0,0 +1,82 @@
++#include "types.h"
++#include "user.h"
++
++
++int
++main(int argc, char *argv[])
++{
++	if (argc != 2){
++				printf(1, "Usage: SMLsanity <n>\n");
++				exit();
++ 		}
++	int i;
++	int n;
++	int j = 0;
++	int k;
++	int retime;
++	int rutime;
++	int stime;
++	int sums[3][3];
++	for (i = 0; i < 3; i++)
++		for (j = 0; j < 3; j++)
++			sums[i][j] = 0;
++	n = atoi(argv[1]);
++	i = n; //unimportant
++	int pid;
++	for (i = 0; i < 3 * n; i++) {
++		j = i % 3;
++		pid = fork();
++		if (pid == 0) {//child
++			j = (getpid() - 4) % 3; // ensures independence from the first son's pid when gathering the results in the second part of the program
++			#ifdef SML
++			switch(j) {
++				case 0:
++          set_prio(1);
++					break;
++				case 1:
++          set_prio(2);
++					break;
++				case 2:
++          set_prio(3);
++					break;
++			}
++			#endif
++      for (k = 0; k < 100; k++){
++        for (j = 0; j < 1000000; j++){}
++      }
++			exit(); // children exit here
++		}
++		continue; // father continues to spawn the next child
++	}
++	for (i = 0; i < 3 * n; i++) {
++		pid = wait2(&retime, &rutime, &stime);
++		int res = (pid - 4) % 3; // correlates to j in the dispatching loop
++		switch(res) {
++			case 0: // CPU bound processes
++				printf(1, "Priority 1, pid: %d, ready: %d, running: %d, sleeping: %d, turnaround: %d\n", pid, retime, rutime, stime, retime + rutime + stime);
++				sums[0][0] += retime;
++				sums[0][1] += rutime;
++				sums[0][2] += stime;
++				break;
++			case 1: // CPU bound processes, short tasks
++				printf(1, "Priority 2, pid: %d, ready: %d, running: %d, sleeping: %d, turnaround: %d\n", pid, retime, rutime, stime, retime + rutime + stime);
++				sums[1][0] += retime;
++				sums[1][1] += rutime;
++				sums[1][2] += stime;
++				break;
++			case 2: // simulating I/O bound processes
++				printf(1, "Priority 3, pid: %d, ready: %d, running: %d, sleeping: %d, turnaround: %d\n", pid, retime, rutime, stime, retime + rutime + stime);
++				sums[2][0] += retime;
++				sums[2][1] += rutime;
++				sums[2][2] += stime;
++				break;
++		}
++	}
++	for (i = 0; i < 3; i++)
++		for (j = 0; j < 3; j++)
++			sums[i][j] /= n;
++  printf(1, "\nPriority 1:\nAverage ready time: %d\nAverage running time: %d\nAverage sleeping time: %d\nAverage turnaround time: %d\n\n", sums[0][0], sums[0][1], sums[0][2], sums[0][0] + sums[0][1] + sums[0][2]);
++	printf(1, "Priority 2:\nAverage ready time: %d\nAverage running time: %d\nAverage sleeping time: %d\nAverage turnaround time: %d\n\n", sums[1][0], sums[1][1], sums[1][2], sums[1][0] + sums[1][1] + sums[1][2]);
++	printf(1, "Priority 3:\nAverage ready time: %d\nAverage running time: %d\nAverage sleeping time: %d\nAverage turnaround time: %d\n\n", sums[2][0], sums[2][1], sums[2][2], sums[2][0] + sums[2][1] + sums[2][2]);
++	exit();
++}
+\ No newline at end of file
+diff -ruN xv6-public/syscall.c xv6-final/syscall.c
+--- xv6-public/syscall.c	2021-09-28 19:25:28.162489000 +0530
++++ xv6-final/syscall.c	2021-09-30 16:57:07.564541000 +0530
+@@ -103,6 +103,10 @@
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_history(void);
++extern int sys_wait2(void);
++extern int sys_set_prio(void);
++extern int sys_yield(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +130,10 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_history]   sys_history,
++[SYS_wait2] sys_wait2,
++[SYS_set_prio] sys_set_prio,
++[SYS_yield]   sys_yield
+ };
+ 
+ void
+@@ -143,3 +151,4 @@
+     curproc->tf->eax = -1;
+   }
+ }
++
+diff -ruN xv6-public/syscall.c.orig xv6-final/syscall.c.orig
+--- xv6-public/syscall.c.orig	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/syscall.c.orig	2021-09-30 16:57:07.564541000 +0530
+@@ -0,0 +1,150 @@
++#include "types.h"
++#include "defs.h"
++#include "param.h"
++#include "memlayout.h"
++#include "mmu.h"
++#include "proc.h"
++#include "x86.h"
++#include "syscall.h"
++
++// User code makes a system call with INT T_SYSCALL.
++// System call number in %eax.
++// Arguments on the stack, from the user call to the C
++// library system call function. The saved user %esp points
++// to a saved program counter, and then the first argument.
++
++// Fetch the int at addr from the current process.
++int
++fetchint(uint addr, int *ip)
++{
++  struct proc *curproc = myproc();
++
++  if(addr >= curproc->sz || addr+4 > curproc->sz)
++    return -1;
++  *ip = *(int*)(addr);
++  return 0;
++}
++
++// Fetch the nul-terminated string at addr from the current process.
++// Doesn't actually copy the string - just sets *pp to point at it.
++// Returns length of string, not including nul.
++int
++fetchstr(uint addr, char **pp)
++{
++  char *s, *ep;
++  struct proc *curproc = myproc();
++
++  if(addr >= curproc->sz)
++    return -1;
++  *pp = (char*)addr;
++  ep = (char*)curproc->sz;
++  for(s = *pp; s < ep; s++){
++    if(*s == 0)
++      return s - *pp;
++  }
++  return -1;
++}
++
++// Fetch the nth 32-bit system call argument.
++int
++argint(int n, int *ip)
++{
++  return fetchint((myproc()->tf->esp) + 4 + 4*n, ip);
++}
++
++// Fetch the nth word-sized system call argument as a pointer
++// to a block of memory of size bytes.  Check that the pointer
++// lies within the process address space.
++int
++argptr(int n, char **pp, int size)
++{
++  int i;
++  struct proc *curproc = myproc();
++ 
++  if(argint(n, &i) < 0)
++    return -1;
++  if(size < 0 || (uint)i >= curproc->sz || (uint)i+size > curproc->sz)
++    return -1;
++  *pp = (char*)i;
++  return 0;
++}
++
++// Fetch the nth word-sized system call argument as a string pointer.
++// Check that the pointer is valid and the string is nul-terminated.
++// (There is no shared writable memory, so the string can't change
++// between this check and being used by the kernel.)
++int
++argstr(int n, char **pp)
++{
++  int addr;
++  if(argint(n, &addr) < 0)
++    return -1;
++  return fetchstr(addr, pp);
++}
++
++extern int sys_chdir(void);
++extern int sys_close(void);
++extern int sys_dup(void);
++extern int sys_exec(void);
++extern int sys_exit(void);
++extern int sys_fork(void);
++extern int sys_fstat(void);
++extern int sys_getpid(void);
++extern int sys_kill(void);
++extern int sys_link(void);
++extern int sys_mkdir(void);
++extern int sys_mknod(void);
++extern int sys_open(void);
++extern int sys_pipe(void);
++extern int sys_read(void);
++extern int sys_sbrk(void);
++extern int sys_sleep(void);
++extern int sys_unlink(void);
++extern int sys_wait(void);
++extern int sys_write(void);
++extern int sys_uptime(void);
++extern int sys_history(void);
++extern int sys_wait2(void);
++
++static int (*syscalls[])(void) = {
++[SYS_fork]    sys_fork,
++[SYS_exit]    sys_exit,
++[SYS_wait]    sys_wait,
++[SYS_pipe]    sys_pipe,
++[SYS_read]    sys_read,
++[SYS_kill]    sys_kill,
++[SYS_exec]    sys_exec,
++[SYS_fstat]   sys_fstat,
++[SYS_chdir]   sys_chdir,
++[SYS_dup]     sys_dup,
++[SYS_getpid]  sys_getpid,
++[SYS_sbrk]    sys_sbrk,
++[SYS_sleep]   sys_sleep,
++[SYS_uptime]  sys_uptime,
++[SYS_open]    sys_open,
++[SYS_write]   sys_write,
++[SYS_mknod]   sys_mknod,
++[SYS_unlink]  sys_unlink,
++[SYS_link]    sys_link,
++[SYS_mkdir]   sys_mkdir,
++[SYS_close]   sys_close,
++[SYS_history]   sys_history,
++[SYS_wait2] sys_wait2
++};
++
++void
++syscall(void)
++{
++  int num;
++  struct proc *curproc = myproc();
++
++  num = curproc->tf->eax;
++  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
++    curproc->tf->eax = syscalls[num]();
++  } else {
++    cprintf("%d %s: unknown sys call %d\n",
++            curproc->pid, curproc->name, num);
++    curproc->tf->eax = -1;
++  }
++}
++
+diff -ruN xv6-public/syscall.h xv6-final/syscall.h
+--- xv6-public/syscall.h	2021-09-28 19:25:28.162489000 +0530
++++ xv6-final/syscall.h	2021-09-30 16:57:07.564541000 +0530
+@@ -20,3 +20,7 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_history  22
++#define SYS_wait2 23
++#define SYS_set_prio 24
++#define SYS_yield  25
+\ No newline at end of file
+diff -ruN xv6-public/syscall.h.orig xv6-final/syscall.h.orig
+--- xv6-public/syscall.h.orig	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/syscall.h.orig	2021-09-30 16:57:07.564541000 +0530
+@@ -0,0 +1,24 @@
++// System call numbers
++#define SYS_fork    1
++#define SYS_exit    2
++#define SYS_wait    3
++#define SYS_pipe    4
++#define SYS_read    5
++#define SYS_kill    6
++#define SYS_exec    7
++#define SYS_fstat   8
++#define SYS_chdir   9
++#define SYS_dup    10
++#define SYS_getpid 11
++#define SYS_sbrk   12
++#define SYS_sleep  13
++#define SYS_uptime 14
++#define SYS_open   15
++#define SYS_write  16
++#define SYS_mknod  17
++#define SYS_unlink 18
++#define SYS_link   19
++#define SYS_mkdir  20
++#define SYS_close  21
++#define SYS_history  22
++#define SYS_wait2 23
+diff -ruN xv6-public/sysproc.c xv6-final/sysproc.c
+--- xv6-public/sysproc.c	2021-09-28 19:25:28.162489000 +0530
++++ xv6-final/sysproc.c	2021-09-30 16:57:07.564541000 +0530
+@@ -6,6 +6,7 @@
+ #include "memlayout.h"
+ #include "mmu.h"
+ #include "proc.h"
++#include "console.h"
+ 
+ int
+ sys_fork(void)
+@@ -89,3 +90,42 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++/*
++  this is the actual function being called from syscall.c
++  @returns - 0 if suceeded, 1 if no history in the historyId given, 2 if illgal history id
++*/
++int sys_history(void) {
++  char *buffer;
++  int historyId;
++  argptr(0, &buffer, 1);
++  argint(1, &historyId);
++  return history(buffer, historyId);
++}
++
++
++int sys_wait2(void) {
++  int res;
++  int retime = 0;
++  int rutime = 0;
++  int stime = 0;
++  argint(0, &retime);
++  argint(1, &rutime);
++  argint(2, &stime);
++  res = sys_wait();
++  *(int*)retime = myproc()->retime;
++  *(int*)rutime = myproc()->rutime;
++  *(int*)stime = myproc()->stime;
++  return res;
++}
++
++int sys_set_prio(void) {
++  int priority;
++  argint(0, &priority);
++  return set_prio(priority);
++}
++
++int sys_yield(void) {
++  yield();
++  return 0;
++}
+\ No newline at end of file
+diff -ruN xv6-public/sysproc.c.orig xv6-final/sysproc.c.orig
+--- xv6-public/sysproc.c.orig	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/sysproc.c.orig	2021-09-30 16:57:07.564541000 +0530
+@@ -0,0 +1,120 @@
++#include "types.h"
++#include "x86.h"
++#include "defs.h"
++#include "date.h"
++#include "param.h"
++#include "memlayout.h"
++#include "mmu.h"
++#include "proc.h"
++#include "console.h"
++
++int
++sys_fork(void)
++{
++  return fork();
++}
++
++int
++sys_exit(void)
++{
++  exit();
++  return 0;  // not reached
++}
++
++int
++sys_wait(void)
++{
++  return wait();
++}
++
++int
++sys_kill(void)
++{
++  int pid;
++
++  if(argint(0, &pid) < 0)
++    return -1;
++  return kill(pid);
++}
++
++int
++sys_getpid(void)
++{
++  return myproc()->pid;
++}
++
++int
++sys_sbrk(void)
++{
++  int addr;
++  int n;
++
++  if(argint(0, &n) < 0)
++    return -1;
++  addr = myproc()->sz;
++  if(growproc(n) < 0)
++    return -1;
++  return addr;
++}
++
++int
++sys_sleep(void)
++{
++  int n;
++  uint ticks0;
++
++  if(argint(0, &n) < 0)
++    return -1;
++  acquire(&tickslock);
++  ticks0 = ticks;
++  while(ticks - ticks0 < n){
++    if(myproc()->killed){
++      release(&tickslock);
++      return -1;
++    }
++    sleep(&ticks, &tickslock);
++  }
++  release(&tickslock);
++  return 0;
++}
++
++// return how many clock tick interrupts have occurred
++// since start.
++int
++sys_uptime(void)
++{
++  uint xticks;
++
++  acquire(&tickslock);
++  xticks = ticks;
++  release(&tickslock);
++  return xticks;
++}
++
++/*
++  this is the actual function being called from syscall.c
++  @returns - 0 if suceeded, 1 if no history in the historyId given, 2 if illgal history id
++*/
++int sys_history(void) {
++  char *buffer;
++  int historyId;
++  argptr(0, &buffer, 1);
++  argint(1, &historyId);
++  return history(buffer, historyId);
++}
++
++
++int sys_wait2(void) {
++  int res;
++  int retime = 0;
++  int rutime = 0;
++  int stime = 0;
++  argint(0, &retime);
++  argint(1, &rutime);
++  argint(2, &stime);
++  res = sys_wait();
++  *(int*)retime = myproc()->retime;
++  *(int*)rutime = myproc()->rutime;
++  *(int*)stime = myproc()->stime;
++  return res;
++}
+diff -ruN xv6-public/trap.c xv6-final/trap.c
+--- xv6-public/trap.c	2021-09-28 19:25:28.162489000 +0530
++++ xv6-final/trap.c	2021-09-30 22:53:09.356655000 +0530
+@@ -13,7 +13,11 @@
+ extern uint vectors[];  // in vectors.S: array of 256 entry pointers
+ struct spinlock tickslock;
+ uint ticks;
+-
++uint tickcycle;
++extern void resettickscycle(uint*);
++#ifdef DML
++extern void decpriority(void);
++#endif
+ void
+ tvinit(void)
+ {
+@@ -51,12 +55,17 @@
+     if(cpuid() == 0){
+       acquire(&tickslock);
+       ticks++;
++      updatestatistics();
+       wakeup(&ticks);
+       release(&tickslock);
+     }
+     lapiceoi();
+     break;
+   case T_IRQ0 + IRQ_IDE:
++    #ifdef FCFS
++    #else
++    resettickscycle(&tickcycle);
++    #endif
+     ideintr();
+     lapiceoi();
+     break;
+@@ -64,10 +73,18 @@
+     // Bochs generates spurious IDE1 interrupts.
+     break;
+   case T_IRQ0 + IRQ_KBD:
++    #ifdef FCFS
++    #else
++    resettickscycle(&tickcycle);
++    #endif
+     kbdintr();
+     lapiceoi();
+     break;
+   case T_IRQ0 + IRQ_COM1:
++    #ifdef FCFS
++    #else
++    resettickscycle(&tickcycle);
++    #endif
+     uartintr();
+     lapiceoi();
+     break;
+@@ -100,12 +117,29 @@
+   if(myproc() && myproc()->killed && (tf->cs&3) == DPL_USER)
+     exit();
+ 
++#ifdef FCFS
++// code...
++#else
++#ifdef DML
+   // Force process to give up CPU on clock tick.
+   // If interrupts were on while locks held, would need to check nlock.
+   if(myproc() && myproc()->state == RUNNING &&
+-     tf->trapno == T_IRQ0+IRQ_TIMER)
++     tf->trapno == T_IRQ0+IRQ_TIMER && tickcycle++ == QUANTA){
++    resettickscycle(&tickcycle);
++    decpriority();
+     yield();
++  }
++#else
++  // Force process to give up CPU on clock tick.
++  // If interrupts were on while locks held, would need to check nlock.
++  if(myproc() && myproc()->state == RUNNING &&
++     tf->trapno == T_IRQ0+IRQ_TIMER && tickcycle++ == QUANTA){
++    resettickscycle(&tickcycle);
++    yield();
++  }
+ 
++#endif
++#endif
+   // Check if the process has been killed since we yielded
+   if(myproc() && myproc()->killed && (tf->cs&3) == DPL_USER)
+     exit();
+diff -ruN xv6-public/trap.c.orig xv6-final/trap.c.orig
+--- xv6-public/trap.c.orig	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/trap.c.orig	2021-09-30 16:57:07.564541000 +0530
+@@ -0,0 +1,113 @@
++#include "types.h"
++#include "defs.h"
++#include "param.h"
++#include "memlayout.h"
++#include "mmu.h"
++#include "proc.h"
++#include "x86.h"
++#include "traps.h"
++#include "spinlock.h"
++
++// Interrupt descriptor table (shared by all CPUs).
++struct gatedesc idt[256];
++extern uint vectors[];  // in vectors.S: array of 256 entry pointers
++struct spinlock tickslock;
++uint ticks;
++
++void
++tvinit(void)
++{
++  int i;
++
++  for(i = 0; i < 256; i++)
++    SETGATE(idt[i], 0, SEG_KCODE<<3, vectors[i], 0);
++  SETGATE(idt[T_SYSCALL], 1, SEG_KCODE<<3, vectors[T_SYSCALL], DPL_USER);
++
++  initlock(&tickslock, "time");
++}
++
++void
++idtinit(void)
++{
++  lidt(idt, sizeof(idt));
++}
++
++//PAGEBREAK: 41
++void
++trap(struct trapframe *tf)
++{
++  if(tf->trapno == T_SYSCALL){
++    if(myproc()->killed)
++      exit();
++    myproc()->tf = tf;
++    syscall();
++    if(myproc()->killed)
++      exit();
++    return;
++  }
++
++  switch(tf->trapno){
++  case T_IRQ0 + IRQ_TIMER:
++    if(cpuid() == 0){
++      acquire(&tickslock);
++      ticks++;
++      updatestatistics();
++      wakeup(&ticks);
++      release(&tickslock);
++    }
++    lapiceoi();
++    break;
++  case T_IRQ0 + IRQ_IDE:
++    ideintr();
++    lapiceoi();
++    break;
++  case T_IRQ0 + IRQ_IDE+1:
++    // Bochs generates spurious IDE1 interrupts.
++    break;
++  case T_IRQ0 + IRQ_KBD:
++    kbdintr();
++    lapiceoi();
++    break;
++  case T_IRQ0 + IRQ_COM1:
++    uartintr();
++    lapiceoi();
++    break;
++  case T_IRQ0 + 7:
++  case T_IRQ0 + IRQ_SPURIOUS:
++    cprintf("cpu%d: spurious interrupt at %x:%x\n",
++            cpuid(), tf->cs, tf->eip);
++    lapiceoi();
++    break;
++
++  //PAGEBREAK: 13
++  default:
++    if(myproc() == 0 || (tf->cs&3) == 0){
++      // In kernel, it must be our mistake.
++      cprintf("unexpected trap %d from cpu %d eip %x (cr2=0x%x)\n",
++              tf->trapno, cpuid(), tf->eip, rcr2());
++      panic("trap");
++    }
++    // In user space, assume process misbehaved.
++    cprintf("pid %d %s: trap %d err %d on cpu %d "
++            "eip 0x%x addr 0x%x--kill proc\n",
++            myproc()->pid, myproc()->name, tf->trapno,
++            tf->err, cpuid(), tf->eip, rcr2());
++    myproc()->killed = 1;
++  }
++
++  // Force process exit if it has been killed and is in user space.
++  // (If it is still executing in the kernel, let it keep running
++  // until it gets to the regular system call return.)
++  if(myproc() && myproc()->killed && (tf->cs&3) == DPL_USER)
++    exit();
++
++  // Force process to give up CPU on clock tick.
++  // If interrupts were on while locks held, would need to check nlock.
++  if(myproc() && myproc()->state == RUNNING &&
++     tf->trapno == T_IRQ0+IRQ_TIMER)
++    yield();
++
++  // Check if the process has been killed since we yielded
++  if(myproc() && myproc()->killed && (tf->cs&3) == DPL_USER)
++    exit();
++}
+diff -ruN xv6-public/user.h xv6-final/user.h
+--- xv6-public/user.h	2021-09-28 19:25:28.162489000 +0530
++++ xv6-final/user.h	2021-09-30 16:57:07.564541000 +0530
+@@ -23,6 +23,12 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int history(char*, int);
++int wait2(int*, int*, int*);
++#ifdef SML
++int set_prio(int);
++#endif
++int yield(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+@@ -37,3 +43,4 @@
+ void* malloc(uint);
+ void free(void*);
+ int atoi(const char*);
++
+diff -ruN xv6-public/user.h.orig xv6-final/user.h.orig
+--- xv6-public/user.h.orig	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/user.h.orig	2021-09-30 16:57:07.564541000 +0530
+@@ -0,0 +1,42 @@
++struct stat;
++struct rtcdate;
++
++// system calls
++int fork(void);
++int exit(void) __attribute__((noreturn));
++int wait(void);
++int pipe(int*);
++int write(int, const void*, int);
++int read(int, void*, int);
++int close(int);
++int kill(int);
++int exec(char*, char**);
++int open(const char*, int);
++int mknod(const char*, short, short);
++int unlink(const char*);
++int fstat(int fd, struct stat*);
++int link(const char*, const char*);
++int mkdir(const char*);
++int chdir(const char*);
++int dup(int);
++int getpid(void);
++char* sbrk(int);
++int sleep(int);
++int uptime(void);
++int history(char*, int);
++int wait2(int*, int*, int*);
++
++// ulib.c
++int stat(const char*, struct stat*);
++char* strcpy(char*, const char*);
++void *memmove(void*, const void*, int);
++char* strchr(const char*, char c);
++int strcmp(const char*, const char*);
++void printf(int, const char*, ...);
++char* gets(char*, int max);
++uint strlen(const char*);
++void* memset(void*, int, uint);
++void* malloc(uint);
++void free(void*);
++int atoi(const char*);
++
+diff -ruN xv6-public/usys.S xv6-final/usys.S
+--- xv6-public/usys.S	2021-09-28 19:25:28.162489000 +0530
++++ xv6-final/usys.S	2021-09-30 16:57:07.564541000 +0530
+@@ -29,3 +29,7 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(history)
++SYSCALL(wait2)
++SYSCALL(set_prio) 
++SYSCALL(yield)
+\ No newline at end of file
+diff -ruN xv6-public/usys.S.orig xv6-final/usys.S.orig
+--- xv6-public/usys.S.orig	1970-01-01 05:30:00.000000000 +0530
++++ xv6-final/usys.S.orig	2021-09-30 16:57:07.564541000 +0530
+@@ -0,0 +1,33 @@
++#include "syscall.h"
++#include "traps.h"
++
++#define SYSCALL(name) \
++  .globl name; \
++  name: \
++    movl $SYS_ ## name, %eax; \
++    int $T_SYSCALL; \
++    ret
++
++SYSCALL(fork)
++SYSCALL(exit)
++SYSCALL(wait)
++SYSCALL(pipe)
++SYSCALL(read)
++SYSCALL(write)
++SYSCALL(close)
++SYSCALL(kill)
++SYSCALL(exec)
++SYSCALL(open)
++SYSCALL(mknod)
++SYSCALL(unlink)
++SYSCALL(fstat)
++SYSCALL(link)
++SYSCALL(mkdir)
++SYSCALL(chdir)
++SYSCALL(dup)
++SYSCALL(getpid)
++SYSCALL(sbrk)
++SYSCALL(sleep)
++SYSCALL(uptime)
++SYSCALL(history)
++SYSCALL(wait2)
